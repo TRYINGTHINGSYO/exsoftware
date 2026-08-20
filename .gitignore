@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+.exsoftware-tmp/
+*.jsonl
+.DS_Store
+Thumbs.db

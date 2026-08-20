@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>exsoftware</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <div class="brand">exsoftware</div>
+      <div class="tag">Software that explains software · static analysis only · files are not executed</div>
+    </div>
+    <div class="top-meta" id="status">Drop a file or choose one.</div>
+  </header>
+
+  <section class="drop" id="dropzone" tabindex="0">
+    <input type="file" id="file-input">
+    <div class="drop-copy">
+      <strong>Drop a file here</strong>
+      <span>or <label for="file-input">choose a file</label>. Local analysis, no network lookups.</span>
+    </div>
+  </section>
+
+  <main id="report" hidden>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="composition">Composition</button>
+      <button class="tab" data-tab="findings">Findings</button>
+      <button class="tab" data-tab="evidence">Evidence</button>
+      <button class="tab" data-tab="details">Technical details</button>
+    </nav>
+
+    <section class="identity-bar" id="identity-bar"></section>
+
+    <section class="panel active" id="panel-overview"></section>
+    <section class="panel" id="panel-composition"></section>
+    <section class="panel" id="panel-findings"></section>
+    <section class="panel" id="panel-evidence"></section>
+    <section class="panel" id="panel-details"></section>
+  </main>
+
+  <p class="footnote">
+    Severity is attention, not a malware verdict. URLs and IPs are displayed, never fetched.
+    A future sandbox module can be added; this build does not run the file.
+  </p>
+  <script src="/static/app.js"></script>
+</body>
+</html>
