@@ -15,8 +15,9 @@ def test_security_status_probe_is_honest():
         or data["observed"].get("external_connect_succeeded")
         or data["observed"].get("external_connect_v6_succeeded")
         or data["observed"].get("host_to_worker_connect_succeeded")
-        or data["observed"].get("udp_send_succeeded")
-        or data["observed"].get("udp_send_v6_succeeded")
+        or data["observed"].get("host_to_worker_connect_v6_succeeded")
+        or data["observed"].get("udp_localhost_received")
+        or data["observed"].get("udp_localhost_received_v6")
     )
     if data["observed"]["read_outside_succeeded"]:
         assert data["capabilities"]["filesystem_restriction"] != "enforced"
@@ -28,3 +29,6 @@ def test_security_status_probe_is_honest():
     assert "listen_succeeded" in data["observed"]
     assert "listen_bind_succeeded" in data["observed"]
     assert "host_to_worker_connect_succeeded" in data["observed"]
+    assert "host_to_worker_connect_v6_succeeded" in data["observed"]
+    assert "udp_localhost_received" in data["observed"]
+    assert "probe_completeness" in data["observed"]

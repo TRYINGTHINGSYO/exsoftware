@@ -168,9 +168,13 @@ class IsolateNetworkAnalyzer(Analyzer):
 
         extra = ctx.extra or {}
         host = extra.get("probe_host") or "127.0.0.1"
-        port = int(extra.get("probe_port") or 1)
+        port = extra.get("probe_port")
         host_v6 = extra.get("probe_host_v6") or "::1"
         port_v6 = extra.get("probe_port_v6")
+        udp_port_v4 = extra.get("udp_probe_port_v4")
+        udp_token_v4 = extra.get("udp_probe_token_v4")
+        udp_port_v6 = extra.get("udp_probe_port_v6")
+        udp_token_v6 = extra.get("udp_probe_token_v6")
         details: dict = {
             "connect_ok": False,
             "connect_v6_ok": False,
@@ -178,19 +182,22 @@ class IsolateNetworkAnalyzer(Analyzer):
             "listen_v6_ok": False,
             "external_connect_ok": False,
             "external_connect_v6_ok": False,
-            "udp_send_ok": False,
-            "udp_send_v6_ok": False,
+            "udp_localhost_send_ok": False,
+            "udp_localhost_send_v6_ok": False,
             "denied": False,
         }
-        try:
-            with socket.create_connection((host, port), timeout=1.0) as sock:
-                sock.sendall(b"x")
-            details["connect_ok"] = True
-        except OSError as exc:
-            details["denied"] = True
-            details["connect_error"] = str(exc)
-            details["connect_errno"] = getattr(exc, "errno", None)
-            details["connect_winerror"] = getattr(exc, "winerror", None)
+        if port is not None:
+            try:
+                with socket.create_connection((host, int(port)), timeout=1.0) as sock:
+                    sock.sendall(b"x")
+                details["connect_ok"] = True
+            except OSError as exc:
+                details["denied"] = True
+                details["connect_error"] = str(exc)
+                details["connect_errno"] = getattr(exc, "errno", None)
+                details["connect_winerror"] = getattr(exc, "winerror", None)
+        else:
+            details["connect_skipped"] = True
         if port_v6 is not None:
             try:
                 with socket.create_connection((host_v6, int(port_v6)), timeout=1.0) as sock:
@@ -200,6 +207,8 @@ class IsolateNetworkAnalyzer(Analyzer):
                 details["connect_v6_error"] = str(exc)
                 details["connect_v6_errno"] = getattr(exc, "errno", None)
                 details["connect_v6_winerror"] = getattr(exc, "winerror", None)
+        else:
+            details["connect_v6_skipped"] = True
         try:
             with socket.create_connection(("192.0.2.1", 80), timeout=1.0):
                 details["external_connect_ok"] = True
@@ -214,30 +223,34 @@ class IsolateNetworkAnalyzer(Analyzer):
             details["external_connect_v6_error"] = str(exc)
             details["external_connect_v6_errno"] = getattr(exc, "errno", None)
             details["external_connect_v6_winerror"] = getattr(exc, "winerror", None)
-        try:
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Localhost UDP: parent-selected loopback endpoint + unique token.
+        # TEST-NET sendto success/failure is not treated as containment evidence.
+        if udp_port_v4 is not None and udp_token_v4:
             try:
-                udp.settimeout(1.0)
-                udp.sendto(b"exsoftware-udp-probe", ("192.0.2.1", 53))
-                details["udp_send_ok"] = True
-            finally:
-                udp.close()
-        except OSError as exc:
-            details["udp_send_error"] = str(exc)
-            details["udp_send_errno"] = getattr(exc, "errno", None)
-            details["udp_send_winerror"] = getattr(exc, "winerror", None)
-        try:
-            udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    udp.settimeout(1.0)
+                    udp.sendto(str(udp_token_v4).encode("utf-8"), ("127.0.0.1", int(udp_port_v4)))
+                    details["udp_localhost_send_ok"] = True
+                finally:
+                    udp.close()
+            except OSError as exc:
+                details["udp_localhost_send_error"] = str(exc)
+                details["udp_localhost_send_errno"] = getattr(exc, "errno", None)
+                details["udp_localhost_send_winerror"] = getattr(exc, "winerror", None)
+        if udp_port_v6 is not None and udp_token_v6:
             try:
-                udp6.settimeout(1.0)
-                udp6.sendto(b"exsoftware-udp-probe", ("2001:db8::1", 53))
-                details["udp_send_v6_ok"] = True
-            finally:
-                udp6.close()
-        except OSError as exc:
-            details["udp_send_v6_error"] = str(exc)
-            details["udp_send_v6_errno"] = getattr(exc, "errno", None)
-            details["udp_send_v6_winerror"] = getattr(exc, "winerror", None)
+                udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                try:
+                    udp6.settimeout(1.0)
+                    udp6.sendto(str(udp_token_v6).encode("utf-8"), ("::1", int(udp_port_v6)))
+                    details["udp_localhost_send_v6_ok"] = True
+                finally:
+                    udp6.close()
+            except OSError as exc:
+                details["udp_localhost_send_v6_error"] = str(exc)
+                details["udp_localhost_send_v6_errno"] = getattr(exc, "errno", None)
+                details["udp_localhost_send_v6_winerror"] = getattr(exc, "winerror", None)
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.bind(("127.0.0.1", 0))
@@ -295,16 +308,17 @@ class IsolateNetworkListenAnalyzer(Analyzer):
             "ready_written": False,
             "endpoints": [],
         }
-        servers: list[tuple[Any, str, str, int]] = []
+        servers: list[tuple[Any, str, int]] = []
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.bind(("127.0.0.1", 0))
             srv.listen(1)
             port = int(srv.getsockname()[1])
-            servers.append((srv, "ipv4", "127.0.0.1", port))
+            servers.append((srv, "ipv4", port))
             details["listen_ok"] = True
             details["listen_port"] = port
-            details["endpoints"].append({"family": "ipv4", "host": "127.0.0.1", "port": port})
+            # Ready file carries family+port only; parent chooses 127.0.0.1 / ::1.
+            details["endpoints"].append({"family": "ipv4", "port": port})
         except OSError as exc:
             details["listen_error"] = str(exc)
             details["listen_errno"] = getattr(exc, "errno", None)
@@ -316,10 +330,10 @@ class IsolateNetworkListenAnalyzer(Analyzer):
             srv6.bind(("::1", 0))
             srv6.listen(1)
             port6 = int(srv6.getsockname()[1])
-            servers.append((srv6, "ipv6", "::1", port6))
+            servers.append((srv6, "ipv6", port6))
             details["listen_v6_ok"] = True
             details["listen_v6_port"] = port6
-            details["endpoints"].append({"family": "ipv6", "host": "::1", "port": port6})
+            details["endpoints"].append({"family": "ipv6", "port": port6})
         except OSError as exc:
             details["listen_v6_error"] = str(exc)
             details["listen_v6_errno"] = getattr(exc, "errno", None)
@@ -328,13 +342,20 @@ class IsolateNetworkListenAnalyzer(Analyzer):
         if workdir and details["endpoints"]:
             ready_path = Path(workdir) / "network_listen_ready.json"
             ready_path.write_text(
-                json.dumps({"tcp": details["endpoints"]}, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "protocol": "exsoftware.network_listen_ready",
+                        "protocol_version": 1,
+                        "tcp": details["endpoints"],
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="utf-8",
             )
             details["ready_written"] = True
 
         per_socket_wait = max(0.5, wait_seconds / max(len(servers), 1))
-        for srv, family, _host, _port in servers:
+        for srv, family, _port in servers:
             try:
                 srv.settimeout(per_socket_wait)
                 conn, peer = srv.accept()

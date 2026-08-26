@@ -47,6 +47,10 @@ TEST_EXTRA_KEYS = frozenset(
         "probe_host_v6",
         "probe_port_v6",
         "listen_accept_seconds",
+        "udp_probe_port_v4",
+        "udp_probe_token_v4",
+        "udp_probe_port_v6",
+        "udp_probe_token_v6",
     }
 )
 
