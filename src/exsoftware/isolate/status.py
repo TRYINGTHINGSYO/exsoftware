@@ -242,6 +242,7 @@ def _finalize(
             attempted=True,
             succeeded=connect_ok,
             error=net_details.get("connect_error"),
+            probe_complete=network_analyzer_completed and not network_analyzer_failed,
         )
     )
     localhost_connect_v6_outcome = (
@@ -251,6 +252,7 @@ def _finalize(
             attempted=True,
             succeeded=connect_v6_ok,
             error=net_details.get("connect_v6_error"),
+            probe_complete=network_analyzer_completed and not network_analyzer_failed,
         )
     )
     if network_analyzer_failed:

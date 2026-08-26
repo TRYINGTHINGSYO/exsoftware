@@ -8,12 +8,11 @@ absence of success is never treated as denial when probes did not finish.
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import socket
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from ..content import digest_bytes
 from ..context import AnalysisContext
@@ -22,9 +21,19 @@ from ..models import FileIdentity
 from .output import BoundedStream
 from .policy import IsolationPolicy
 from .process import child_env, close_job, spawn_worker, terminate_tree, wait_or_timeout
-from .protocol import request_template
+from .protocol import (
+    PROTOCOL_NAME,
+    PROTOCOL_VERSION,
+    REASON_CHILD_CRASH,
+    REASON_CHILD_EXIT,
+    REASON_EMPTY_RESPONSE,
+    REASON_INVALID_RESPONSE,
+    REASON_OVERSIZED,
+    request_template,
+)
 from .snapshot import identity_for_child, parent_context_extra
 from .test_analyzers import IsolateNetworkListenAnalyzer
+from .validate import ProtocolError, validate_response
 from .workspace import OversizedWorkspaceFile, create_workspace, read_workspace_file, rmtree_retry
 
 READY_NAME = "network_listen_ready.json"
@@ -41,6 +50,16 @@ PARENT_LOOPBACK = {
     "ipv6": "::1",
 }
 ALLOWED_FAMILIES = frozenset(PARENT_LOOPBACK)
+
+# Expected well-typed fields from IsolateNetworkListenAnalyzer.details.
+LISTEN_DETAIL_BOOL_FIELDS = (
+    "listen_ok",
+    "listen_v6_ok",
+    "accept_ok",
+    "accept_v6_ok",
+    "ready_written",
+)
+EXPECTED_LISTEN_HELPER_EXIT = 0
 
 
 def meaningful_network_success(observed: dict[str, Any]) -> bool:
@@ -449,38 +468,40 @@ def probe_host_to_worker_listen(
                             observed["host_to_worker_connect_succeeded"] = True
                             observed["host_to_worker_v4_outcome"] = "succeeded"
                     except OSError as exc:
+                        # Do not classify as OS-policy denial until the helper
+                        # response validates; a dead/crashed listener is incomplete.
                         observed["parent_connect_errors"].append(
                             {"family": family, "host": host, "port": port, "error": str(exc)}
                         )
                         if family == "ipv6":
-                            observed["host_to_worker_v6_outcome"] = "denied"
+                            observed["host_to_worker_v6_outcome"] = "incomplete"
                         else:
-                            observed["host_to_worker_v4_outcome"] = "denied"
+                            observed["host_to_worker_v4_outcome"] = "incomplete"
 
         rc = wait_or_timeout(proc, policy.timeout_seconds)
+        observed["returncode"] = rc
+        finalize_listen_comm_from_helper(
+            observed,
+            returncode=rc,
+            response=(
+                None
+                if rc is None
+                else read_listen_helper_response(
+                    workdir,
+                    max_bytes=limits.max_result_bytes,
+                    analyzer_id=IsolateNetworkListenAnalyzer.name,
+                    analyzer_version=IsolateNetworkListenAnalyzer.version,
+                    artifact_id=ctx.artifact_id or "",
+                )
+            ),
+        )
         if rc is None:
             terminate_tree(proc)
-            observed["probe_error"] = observed.get("probe_error") or "listen helper timed out"
-            observed["listen_comm_completed"] = False
-        else:
-            observed["details"] = _read_listen_details(workdir, limits.max_result_bytes)
-            details = observed["details"]
-            if details.get("failed") or details.get("reason") == "exception":
-                observed["probe_error"] = observed.get("probe_error") or "listen helper crashed"
-                observed["listen_comm_completed"] = False
-            else:
-                observed["listen_comm_completed"] = True
-            if details.get("accept_ok") or details.get("accept_v6_ok"):
-                observed["child_accept_succeeded"] = True
-                if not (
-                    observed["host_to_worker_connect_succeeded"]
-                    or observed["host_to_worker_connect_v6_succeeded"]
-                ):
-                    observed["child_accept_without_parent_connect"] = True
         return observed
     except Exception as exc:
         observed["probe_error"] = str(exc) or exc.__class__.__name__
         observed["listen_comm_completed"] = False
+        _demote_unconfirmed_denials(observed)
         return observed
     finally:
         if proc is not None:
@@ -491,14 +512,265 @@ def probe_host_to_worker_listen(
             rmtree_retry(workdir)
 
 
-def classify_connect_outcome(*, attempted: bool, succeeded: bool, error: str | None) -> str:
+def classify_connect_outcome(
+    *,
+    attempted: bool,
+    succeeded: bool,
+    error: str | None,
+    probe_complete: bool = True,
+) -> str:
+    """Classify a connect attempt.
+
+    Socket errors are only treated as OS-policy denial when the surrounding
+    probe completed with interpretable evidence. Incomplete/invalid probes stay
+    ``incomplete`` so absence of success cannot upgrade to enforced.
+    """
     if not attempted:
         return "unavailable"
     if succeeded:
         return "succeeded"
+    if not probe_complete:
+        return "incomplete"
     if error:
         return "denied"
     return "incomplete"
+
+
+def validate_listen_probe_details(details: Any) -> str | None:
+    """Return an error string when listen probe details are missing or mistyped."""
+    if not isinstance(details, dict):
+        return "result.details must be an object"
+    for key in LISTEN_DETAIL_BOOL_FIELDS:
+        if key not in details:
+            return f"missing required probe detail {key!r}"
+        if not isinstance(details[key], bool):
+            return f"probe detail {key!r} must be a boolean"
+    endpoints = details.get("endpoints")
+    if "endpoints" not in details:
+        return "missing required probe detail 'endpoints'"
+    if not isinstance(endpoints, list):
+        return "probe detail 'endpoints' must be a list"
+    if len(endpoints) > READY_MAX_ENDPOINTS:
+        return "probe detail 'endpoints' list too long"
+    for item in endpoints:
+        if not isinstance(item, dict):
+            return "each endpoint must be an object"
+        family = item.get("family")
+        if family not in ALLOWED_FAMILIES:
+            return f"endpoint family {family!r} is unsupported"
+        port = item.get("port")
+        if not isinstance(port, int) or isinstance(port, bool) or port < 1 or port > 65535:
+            return "endpoint port must be an int in 1..65535"
+        if "host" in item and item.get("host") not in {None, "", PARENT_LOOPBACK[family]}:
+            return "endpoint must not supply a non-parent loopback host"
+    return None
+
+
+def read_listen_helper_response(
+    workdir: Path,
+    *,
+    max_bytes: int,
+    analyzer_id: str,
+    analyzer_version: str,
+    artifact_id: str,
+) -> dict[str, Any]:
+    """Read and validate the listen helper response.
+
+    Never collapses missing/malformed responses into an empty details dict.
+    Returns an explicit ``{ok, error, error_code, status, details, ...}`` result.
+    """
+    out: dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "error_code": None,
+        "status": None,
+        "details": None,
+        "response_bytes": None,
+        "protocol": None,
+        "protocol_version": None,
+    }
+    try:
+        raw = read_workspace_file(workdir, RESPONSE_NAME, max_bytes=max_bytes)
+    except OversizedWorkspaceFile as exc:
+        out["error"] = str(exc)
+        out["error_code"] = REASON_OVERSIZED
+        out["response_bytes"] = getattr(exc, "size", None)
+        return out
+    except OSError as exc:
+        out["error"] = f"missing or unreadable response file ({exc})"
+        out["error_code"] = "missing_response"
+        return out
+
+    out["response_bytes"] = len(raw)
+    if not raw:
+        out["error"] = "empty response file"
+        out["error_code"] = REASON_EMPTY_RESPONSE
+        return out
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        out["error"] = f"malformed JSON response ({exc})"
+        out["error_code"] = "malformed_json"
+        return out
+
+    if not isinstance(data, dict):
+        out["error"] = "response root must be an object"
+        out["error_code"] = REASON_INVALID_RESPONSE
+        return out
+
+    out["protocol"] = data.get("protocol")
+    out["protocol_version"] = data.get("protocol_version")
+    if data.get("protocol") != PROTOCOL_NAME or data.get("protocol_version") != PROTOCOL_VERSION:
+        out["error"] = (
+            f"wrong protocol/version ({data.get('protocol')!r}/"
+            f"{data.get('protocol_version')!r}); expected {PROTOCOL_NAME!r}/{PROTOCOL_VERSION}"
+        )
+        out["error_code"] = "wrong_protocol"
+        return out
+
+    try:
+        validate_response(
+            data,
+            analyzer_id=analyzer_id,
+            analyzer_version=analyzer_version,
+            artifact_id=artifact_id,
+        )
+    except ProtocolError as exc:
+        out["error"] = str(exc)
+        out["error_code"] = getattr(exc, "code", REASON_INVALID_RESPONSE)
+        return out
+
+    status = data.get("status")
+    out["status"] = status
+    if status != "completed":
+        out["error"] = f"analyzer result status is {status!r}, expected 'completed'"
+        out["error_code"] = "status_not_completed"
+        # Still surface details when present for diagnostics.
+        result = data.get("result")
+        if isinstance(result, dict) and isinstance(result.get("details"), dict):
+            out["details"] = result["details"]
+        return out
+
+    details = (data.get("result") or {}).get("details")
+    field_error = validate_listen_probe_details(details)
+    if field_error:
+        out["error"] = field_error
+        out["error_code"] = "incomplete_details"
+        if isinstance(details, dict):
+            out["details"] = details
+        return out
+
+    out["ok"] = True
+    out["details"] = details
+    return out
+
+
+def finalize_listen_comm_from_helper(
+    observed: dict[str, Any],
+    *,
+    returncode: int | None,
+    response: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Mark listen probe complete only for a successful exit + validated response."""
+    observed["listen_comm_completed"] = False
+    observed["response_validation"] = None
+
+    if returncode is None:
+        observed["probe_error"] = observed.get("probe_error") or "listen helper timed out"
+        _demote_unconfirmed_denials(observed)
+        return observed
+
+    if returncode != EXPECTED_LISTEN_HELPER_EXIT:
+        if _looks_like_crash(returncode):
+            observed["probe_error"] = (
+                observed.get("probe_error")
+                or f"listen helper crashed (returncode={returncode})"
+            )
+            observed["listen_helper_exit_reason"] = REASON_CHILD_CRASH
+        else:
+            observed["probe_error"] = (
+                observed.get("probe_error")
+                or f"listen helper exited nonzero (returncode={returncode})"
+            )
+            observed["listen_helper_exit_reason"] = REASON_CHILD_EXIT
+        if response is not None:
+            observed["response_validation"] = _response_validation_summary(response)
+        _demote_unconfirmed_denials(observed)
+        return observed
+
+    if response is None:
+        observed["probe_error"] = observed.get("probe_error") or "listen helper response missing"
+        _demote_unconfirmed_denials(observed)
+        return observed
+
+    observed["response_validation"] = _response_validation_summary(response)
+    if not response.get("ok"):
+        observed["probe_error"] = (
+            observed.get("probe_error")
+            or response.get("error")
+            or "listen helper response validation failed"
+        )
+        if isinstance(response.get("details"), dict):
+            observed["details"] = response["details"]
+        _demote_unconfirmed_denials(observed)
+        return observed
+
+    details = response.get("details") or {}
+    observed["details"] = details
+    observed["listen_comm_completed"] = True
+    _promote_connect_errors_to_denial(observed)
+    if details.get("accept_ok") or details.get("accept_v6_ok"):
+        observed["child_accept_succeeded"] = True
+        if not (
+            observed.get("host_to_worker_connect_succeeded")
+            or observed.get("host_to_worker_connect_v6_succeeded")
+        ):
+            observed["child_accept_without_parent_connect"] = True
+    return observed
+
+
+def _response_validation_summary(response: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": bool(response.get("ok")),
+        "error": response.get("error"),
+        "error_code": response.get("error_code"),
+        "status": response.get("status"),
+        "response_bytes": response.get("response_bytes"),
+        "protocol": response.get("protocol"),
+        "protocol_version": response.get("protocol_version"),
+    }
+
+
+def _demote_unconfirmed_denials(observed: dict[str, Any]) -> None:
+    for key in ("host_to_worker_v4_outcome", "host_to_worker_v6_outcome"):
+        if observed.get(key) == "denied":
+            observed[key] = "incomplete"
+
+
+def _promote_connect_errors_to_denial(observed: dict[str, Any]) -> None:
+    """After a validated completed helper, treat parent connect OSErrors as denial."""
+    errors = observed.get("parent_connect_errors") or []
+    errored_families = {
+        item.get("family")
+        for item in errors
+        if isinstance(item, dict) and item.get("family") in ALLOWED_FAMILIES
+    }
+    if "ipv4" in errored_families and not observed.get("host_to_worker_connect_succeeded"):
+        if observed.get("host_to_worker_v4_outcome") in {"incomplete", "denied"}:
+            observed["host_to_worker_v4_outcome"] = "denied"
+    if "ipv6" in errored_families and not observed.get("host_to_worker_connect_v6_succeeded"):
+        if observed.get("host_to_worker_v6_outcome") in {"incomplete", "denied"}:
+            observed["host_to_worker_v6_outcome"] = "denied"
+
+
+def _looks_like_crash(returncode: int | None) -> bool:
+    if returncode is None:
+        return False
+    if returncode < 0:
+        return True
+    unsigned = returncode & 0xFFFFFFFF
+    return unsigned >= 0xC0000000
 
 
 def _probe_identity(size: int) -> FileIdentity:
@@ -529,17 +801,6 @@ def _wait_for_ready(workdir: Path, *, timeout: float) -> bytes | None:
             time.sleep(0.05)
             continue
     return None
-
-
-def _read_listen_details(workdir: Path, max_bytes: int) -> dict[str, Any]:
-    try:
-        raw = read_workspace_file(workdir, RESPONSE_NAME, max_bytes=max_bytes)
-        data = json.loads(raw.decode("utf-8"))
-        result = data.get("result") or {}
-        details = result.get("details") or {}
-        return details if isinstance(details, dict) else {}
-    except Exception:
-        return {}
 
 
 def make_udp_tokens() -> dict[str, str]:
