@@ -61,6 +61,29 @@ def digest_bytes(data: bytes) -> dict[str, str]:
     }
 
 
+def digest_path(path) -> dict[str, str]:
+    """Stream multi-hash digest from a filesystem path."""
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+    sha512 = hashlib.sha512()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
+            sha512.update(chunk)
+    return {
+        "md5": md5.hexdigest(),
+        "sha1": sha1.hexdigest(),
+        "sha256": sha256.hexdigest(),
+        "sha512": sha512.hexdigest(),
+    }
+
+
 def named_id(kind: str, value: str) -> str:
     """Stable identity for entities we do not have file bytes for."""
     normalized = value.strip()

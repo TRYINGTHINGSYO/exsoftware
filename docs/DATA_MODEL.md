@@ -127,14 +127,14 @@ Absence of a PE section on a ZIP is `unsupported` for that artifact, not proof t
 3. Set `detected_types` / `detected_families` (leave both `None` for always-on). Child-side `applies()` uses the same metadata; the trusted parent must not call it.
 4. Implement `analyze(ctx) -> AnalyzerResult`.
 5. Return `details` (structured facts) and `findings` (interpretations with nested evidence).
-6. Register the class in `exsoftware.analyzers.ANALYZERS`.
+6. Add a declarative `AnalyzerSpec` to `exsoftware.analyzers.registry` (id, version, title, worker module/class, eligibility sets). The trusted parent must not need to import the implementation module.
 7. Add a rule mapping in `rules/catalog.py` if you introduce new finding ids.
 
 See [ANALYZER_VERSIONING.md](ANALYZER_VERSIONING.md). Analyzer versions were not mass-changed in Stage 4.
 
 The pipeline will:
 
-- select analyzers from declarative `detected_types` / `detected_families` (trusted parent, no analyzer methods)
+- select analyzers from the declarative registry (`detected_types` / `detected_families` on `AnalyzerSpec`; trusted parent, no analyzer methods, no implementation imports)
 - record the run (including unsupported/failed/timeout/terminated)
 - lift findings into the graph with evidence + observed backing observations
 - emit relationships from well-known `details` keys (`imports`, `urls`, `needed`, `certificates`, …)

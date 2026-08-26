@@ -231,30 +231,29 @@ def _refine_riff(data: bytes) -> tuple[str, str, str, str]:
     return "riff", "media", "application/octet-stream", f"RIFF container ({kind.decode('latin-1', 'replace')!r})"
 
 
-def _refine_ole(data: bytes) -> tuple[str, str, str, str]:
-    try:
-        import olefile
-    except ImportError:
-        return "ole", "document", "application/x-ole-storage", "OLE Compound File"
-    if not olefile.isOleFile(data):
-        return "ole", "document", "application/x-ole-storage", "OLE Compound File"
-    with olefile.OleFileIO(data) as ole:
-        streams = {"/" + "/".join(parts) for parts in ole.listdir()}
+def refine_ole_type_from_streams(streams: list[str]) -> tuple[str, str, str, str]:
+    """Classify an OLE compound file from stream *names only*.
 
-        def has(name: str) -> bool:
-            lowered = {item.lower() for item in streams}
-            return name.lower() in lowered or any(item.endswith("/" + name.lower()) for item in lowered)
+    This is not OLE parsing. Names come from a validated contained-worker
+    manifest (untrusted strings used only as metadata). The trusted parent
+    never opens the buffer with olefile to make this decision.
+    """
+    lowered = {str(item).replace("\\", "/").lower() for item in streams}
 
-        if has("/worddocument"):
-            return "doc", "document", "application/msword", "Microsoft Word document (OLE)"
-        if has("/workbook") or has("/book"):
-            return "xls", "document", "application/vnd.ms-excel", "Microsoft Excel workbook (OLE)"
-        if has("/powerpoint document"):
-            return "ppt", "document", "application/vnd.ms-powerpoint", "Microsoft PowerPoint presentation (OLE)"
-        if has("/__properties_version1.0") or has("/__nameid_version1.0"):
-            return "msg", "document", "application/vnd.ms-outlook", "Outlook message (OLE)"
-        if has("/_stringdata") or has("/_tables"):
-            return "msi", "installer", "application/x-msi", "Windows Installer package (OLE)"
+    def has(name: str) -> bool:
+        target = name.lower()
+        return target in lowered or any(item.endswith("/" + target.lstrip("/")) for item in lowered)
+
+    if has("/worddocument"):
+        return "doc", "document", "application/msword", "Microsoft Word document (OLE)"
+    if has("/workbook") or has("/book"):
+        return "xls", "document", "application/vnd.ms-excel", "Microsoft Excel workbook (OLE)"
+    if has("/powerpoint document"):
+        return "ppt", "document", "application/vnd.ms-powerpoint", "Microsoft PowerPoint presentation (OLE)"
+    if has("/__properties_version1.0") or has("/__nameid_version1.0"):
+        return "msg", "document", "application/vnd.ms-outlook", "Outlook message (OLE)"
+    if has("/_stringdata") or has("/_tables"):
+        return "msi", "installer", "application/x-msi", "Windows Installer package (OLE)"
     return "ole", "document", "application/x-ole-storage", "OLE Compound File"
 
 
@@ -359,7 +358,8 @@ def identify_bytes(data: bytes, name: str, size: int | None = None) -> FileIdent
     elif detected_type == "riff":
         detected_type, family, mime, description = _refine_riff(data)
     elif detected_type == "ole":
-        detected_type, family, mime, description = _refine_ole(data)
+        # Subtype (doc/xls/…) requires olefile stream listing in a contained worker.
+        extra["ole_subtype_pending"] = True
     elif detected_type == "macho-fat":
         if _is_java_class(data):
             detected_type, family, mime, description = (

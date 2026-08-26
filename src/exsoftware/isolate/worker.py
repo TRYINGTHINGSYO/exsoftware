@@ -13,7 +13,7 @@ import traceback
 from pathlib import Path
 from time import perf_counter
 
-from ..analyzers import get_analyzer_class
+from ..analyzers.loader import load_analyzer_by_id
 from ..content import digest_bytes
 from ..context import AnalysisContext
 from ..models import AnalyzerError, AnalyzerResult, FileIdentity
@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
         request = json.loads(request_path.read_text(encoding="utf-8"))
         if request.get("protocol") == "exsoftware.container":
             return _run_container(request, workdir, response_path, started)
+        if request.get("protocol") == "exsoftware.ole":
+            return _run_ole(request, workdir, response_path, started)
         validate_request(request)
         _apply_requested_rlimits(request.get("limits") or {})
         result = _run(request, workdir)
@@ -138,6 +140,44 @@ def _run_container(request: dict, workdir: Path, response_path: Path, started: f
     return 0 if payload["status"] == "completed" else 1
 
 
+def _run_ole(request: dict, workdir: Path, response_path: Path, started: float) -> int:
+    from .ole_protocol import OLE_PROTOCOL, OLE_PROTOCOL_VERSION, validate_ole_request
+    from .ole_refine import run_refine
+
+    artifact_id = request.get("artifact_id") or ""
+    try:
+        validate_ole_request(request)
+        _apply_requested_rlimits(request.get("limits") or {})
+        body = run_refine(request, workdir)
+    except ProtocolError as exc:
+        body = {
+            "status": "failed",
+            "is_ole": False,
+            "streams": [],
+            "errors": [{"code": exc.code, "message": str(exc)}],
+        }
+    except Exception as exc:
+        body = {
+            "status": "failed",
+            "is_ole": False,
+            "streams": [],
+            "errors": [{"code": "exception", "message": str(exc) or exc.__class__.__name__}],
+        }
+    payload = {
+        "protocol": OLE_PROTOCOL,
+        "protocol_version": OLE_PROTOCOL_VERSION,
+        "operation": "refine",
+        "artifact_id": artifact_id,
+        "status": body.get("status") or "failed",
+        "is_ole": bool(body.get("is_ole")),
+        "streams": body.get("streams") or [],
+        "errors": body.get("errors") or [],
+        "timing": {"duration_ms": round((perf_counter() - started) * 1000, 3)},
+    }
+    _atomic_write(response_path, payload)
+    return 0 if payload["status"] == "completed" else 1
+
+
 def _run(request: dict, workdir: Path) -> AnalyzerResult:
     analyzer_id = request["analyzer_id"]
     analyzer_version = request["analyzer_version"]
@@ -228,7 +268,7 @@ def _run(request: dict, workdir: Path) -> AnalyzerResult:
 
 
 def resolve_analyzer_class(analyzer_id: str):
-    cls = get_analyzer_class(analyzer_id)
+    cls = load_analyzer_by_id(analyzer_id)
     if cls is not None:
         return cls
     if os_environ_get(TEST_ENV) == "1":

@@ -1,6 +1,7 @@
 # Architectural debt
 
-These are known model issues. Stage 5 moved ZIP-family parsing out of the trusted parent. It did not take the items below on.
+These are known model issues. Trusted-core separation for analyzer imports and
+OLE refinement is done. The items below remain.
 
 ## Entity model
 
@@ -18,16 +19,12 @@ Many analyzers still return legacy-style `details` plus `Finding` objects. The p
 
 Long term, analyzers should emit normalized evidence and observations directly. Isolation serializes `AnalyzerResult` (including findings) across the process boundary; it does not replace this lifting step.
 
-## Analyzer module import in the trusted parent
+## Resolved: analyzer module import in the trusted parent
 
-The parent still does `from .analyzers import ANALYZERS`. That **imports every analyzer implementation module** into the trusted process and runs their module-level code.
+The trusted parent selects analyzers from `exsoftware.analyzers.registry.ANALYZER_REGISTRY` (declarative `AnalyzerSpec` metadata). Importing the engine does **not** import analyzer implementation modules.
 
-`applies()` / `analyze()` are not called in the parent (Stage 4). Eligibility uses class attributes. That is not the same as “analyzer code never executes here.”
+`applies()` / `analyze()` still run only in isolated children. Workers load one implementation via `worker_module` / `worker_class` when that analyzer runs.
 
-Import-time side effects today are mostly class definitions and standard-library imports. `ArchiveAnalyzer` lazy-imports `zipfile`/`tarfile` inside `analyze()`, so those parsers are not loaded by the parent import. PE/PDF/image/OLE parser libraries are also imported inside `analyze()`.
+## Resolved: OLE refinement in the trusted parent
 
-Preferred long-term direction: a declarative eligibility registry that the parent can read without importing analyzer implementation modules. Not done in Stage 5.
-
-## Remaining trusted parsers
-
-`identify._refine_ole` still uses `olefile` in the parent. ZIP was moved; OLE was not.
+`identify_bytes` keeps OLE magic as `ole` with `ole_subtype_pending`. Stream listing uses `olefile` in a contained worker (`exsoftware.ole` protocol). The parent classifies subtype from **validated stream name strings** only (`refine_ole_type_from_streams`). There is no parent-side olefile fallback when the worker fails.

@@ -7,12 +7,14 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from .analyzers import ANALYZERS, is_eligible, skip_reason_for
+from .analyzers.eligibility import is_eligible, skip_reason_for
+from .analyzers.registry import all_specs
 from .content import digest_bytes, sha256_file
 from .context import DEFAULT_MAX_BYTES, AnalysisContext, load_from_bytes, load_from_path
-from .identify import identify_bytes, refine_zip_type_from_names
+from .identify import identify_bytes, refine_ole_type_from_streams, refine_zip_type_from_names
 from .investigation import Investigation
 from .isolate.container_runner import IsolatedContainerRunner
+from .isolate.ole_runner import IsolatedOleRunner
 from .isolate.runner import IsolatedAnalyzerRunner
 from .limits import RecursionLimits
 from .models import (
@@ -92,8 +94,9 @@ def _analyze_context(ctx: AnalysisContext, *, limits: RecursionLimits | None) ->
         },
     )
     ctx.artifact_id = artifact.id
-    stats: dict[str, Any] = {"extracted_count": 0, "extracted_bytes": 0, "container_isolation": None}
+    stats: dict[str, Any] = {"extracted_count": 0, "extracted_bytes": 0, "container_isolation": None, "ole_isolation": None}
     members = _maybe_open_container(ctx, inv, stats)
+    _maybe_refine_ole(ctx, inv, stats)
     root_sections = _run_analyzers(ctx, inv)
     _walk_container_members(ctx, inv, stats, members)
     report_hashes = artifact_hashes if "md5" in artifact_hashes else hashes
@@ -106,45 +109,47 @@ def _analyze_context(ctx: AnalysisContext, *, limits: RecursionLimits | None) ->
 def _run_analyzers(ctx: AnalysisContext, inv: Investigation) -> list[AnalyzerResult]:
     limits = ctx.limits or RecursionLimits()
     timeout_default = limits.analyzer_timeout_seconds
-    planned: list[tuple[type, Any, float, bool, bool]] = []
+    planned: list[tuple[Any, Any, float, bool, bool]] = []
     identity = ctx.identity
-    for cls in ANALYZERS:
-        timeout = cls.timeout_seconds if cls.timeout_seconds is not None else timeout_default
+    for spec in all_specs():
+        timeout = spec.timeout_seconds if spec.timeout_seconds is not None else timeout_default
         run = inv.begin_run(
-            analyzer_id=cls.name,
-            analyzer_version=cls.version,
-            analyzer_title=cls.title,
+            analyzer_id=spec.name,
+            analyzer_version=spec.version,
+            analyzer_title=spec.title,
             artifact_id=ctx.artifact_id or "",
         )
-        eligible = is_eligible(cls, identity)
+        eligible = is_eligible(spec, identity)
         skip_redundant = False
-        if eligible and cls.name == "archive" and _archive_covered_by_container(ctx, identity):
+        if eligible and spec.name == "archive" and _archive_covered_by_container(ctx, identity):
             eligible = False
             skip_redundant = True
-        planned.append((cls, run, timeout, eligible, skip_redundant))
+        planned.append((spec, run, timeout, eligible, skip_redundant))
 
-    isolated_jobs = [(cls, run, timeout) for cls, run, timeout, eligible, _redundant in planned if eligible]
+    isolated_jobs = [(spec, run, timeout) for spec, run, timeout, eligible, _redundant in planned if eligible]
     results: dict[str, AnalyzerResult] = {}
     if limits.isolate_analyzers:
         runner = IsolatedAnalyzerRunner(limits)
         workers = max(1, min(limits.max_analyzer_workers, len(isolated_jobs) or 1))
         if isolated_jobs:
             if workers == 1:
-                for cls, run, timeout in isolated_jobs:
-                    results[run.id] = runner.run(cls, ctx, timeout=timeout)
+                for spec, run, timeout in isolated_jobs:
+                    results[run.id] = runner.run(spec, ctx, timeout=timeout)
             else:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
                     futures = {
-                        pool.submit(runner.run, cls, ctx, timeout=timeout): run.id
-                        for cls, run, timeout in isolated_jobs
+                        pool.submit(runner.run, spec, ctx, timeout=timeout): run.id
+                        for spec, run, timeout in isolated_jobs
                     }
                     for future in as_completed(futures):
                         results[futures[future]] = future.result()
     else:
-        for cls, run, timeout, eligible, _redundant in planned:
+        from .analyzers.loader import load_analyzer_class
+
+        for spec, run, timeout, eligible, _redundant in planned:
             if not eligible:
                 continue
-            analyzer = cls()
+            analyzer = load_analyzer_class(spec)()
             started = perf_counter()
             try:
                 result = analyzer.analyze(ctx)
@@ -159,33 +164,33 @@ def _run_analyzers(ctx: AnalysisContext, inv: Investigation) -> list[AnalyzerRes
             results[run.id] = result
 
     sections: list[AnalyzerResult] = []
-    for cls, run, timeout, eligible, skip_redundant in planned:
+    for spec, run, timeout, eligible, skip_redundant in planned:
         if not eligible:
             if skip_redundant:
                 result = AnalyzerResult(
-                    name=cls.name,
-                    title=cls.title,
+                    name=spec.name,
+                    title=spec.title,
                     applies=True,
                     skipped=True,
                     status="skipped",
                     skip_reason="ZIP-family listing already performed by the contained container worker.",
-                    analyzer_version=cls.version,
+                    analyzer_version=spec.version,
                     details={"isolation": {"mode": "not-started", "reason": "redundant-container-listing", "sandbox": False}},
                 )
             else:
                 result = AnalyzerResult(
-                    name=cls.name,
-                    title=cls.title,
+                    name=spec.name,
+                    title=spec.title,
                     applies=False,
                     skipped=True,
                     status="unsupported",
-                    skip_reason=skip_reason_for(cls, identity),
-                    analyzer_version=cls.version,
+                    skip_reason=skip_reason_for(spec, identity),
+                    analyzer_version=spec.version,
                     details={"isolation": {"mode": "not-started", "reason": "unsupported", "sandbox": False}},
                 )
         else:
             result = results[run.id]
-        inv.ingest_result(cls.name, cls.version, ctx.artifact_id or "", result, run)
+        inv.ingest_result(spec.name, spec.version, ctx.artifact_id or "", result, run)
         sections.append(result)
     return sections
 
@@ -398,8 +403,56 @@ def _walk_container_members(
             extra={"parent_artifact_id": parent_id, "member_name": member.name},
         )
         child_members = _maybe_open_container(child_ctx, inv, stats)
+        _maybe_refine_ole(child_ctx, inv, stats)
         _run_analyzers(child_ctx, inv)
         _walk_container_members(child_ctx, inv, stats, child_members)
+
+
+def _maybe_refine_ole(ctx: AnalysisContext, inv: Investigation, stats: dict[str, Any]) -> None:
+    """Refine OLE subtype via a contained worker. olefile does not run here."""
+    identity = ctx.identity
+    if identity is None:
+        return
+    if not identity.extra.get("ole_subtype_pending"):
+        return
+    if identity.detected_type != "ole":
+        return
+    limits = ctx.limits or RecursionLimits()
+    result = IsolatedOleRunner(limits).refine(
+        ctx.data,
+        artifact_id=ctx.artifact_id or "",
+        timeout=limits.analyzer_timeout_seconds,
+    )
+    stats["ole_isolation"] = result.isolation
+    extra = dict(identity.extra or {})
+    extra.pop("ole_subtype_pending", None)
+    if result.status != "completed":
+        extra["ole_refinement"] = {
+            "status": result.status,
+            "reason": result.reason,
+            "message": result.message,
+            "containment": "static-parser",
+            "fallback": False,
+        }
+        identity.extra = extra
+        return
+    kind, family, mime, description = refine_ole_type_from_streams(result.streams)
+    if not result.is_ole:
+        kind, family, mime, description = (
+            "ole",
+            "document",
+            "application/x-ole-storage",
+            "OLE Compound File",
+        )
+    extra["ole_subtype"] = kind
+    extra["ole_refinement"] = {
+        "status": "completed",
+        "is_ole": result.is_ole,
+        "stream_count": len(result.streams),
+        "containment": "static-parser",
+    }
+    identity.extra = extra
+    _apply_ole_identity(ctx, inv, kind, family, mime, description)
 
 
 def _apply_zip_identity(ctx: AnalysisContext, inv: Investigation, kind: str, family: str, mime: str, description: str) -> None:
@@ -412,6 +465,20 @@ def _apply_zip_identity(ctx: AnalysisContext, inv: Investigation, kind: str, fam
         extra.pop("zip_subtype_pending", None)
         extra["zip_subtype"] = kind
         ctx.identity.extra = extra
+    artifact = inv.artifacts.get(ctx.artifact_id or "")
+    if artifact is not None:
+        artifact.detected_type = kind
+        artifact.detected_family = family
+        artifact.detected_mime = mime
+        artifact.description = description
+
+
+def _apply_ole_identity(ctx: AnalysisContext, inv: Investigation, kind: str, family: str, mime: str, description: str) -> None:
+    if ctx.identity is not None:
+        ctx.identity.detected_type = kind
+        ctx.identity.detected_family = family
+        ctx.identity.detected_mime = mime
+        ctx.identity.description = description
     artifact = inv.artifacts.get(ctx.artifact_id or "")
     if artifact is not None:
         artifact.detected_type = kind
@@ -498,6 +565,8 @@ def _build_report(
                 "capabilities": isolation_caps,
                 "container_protocol": "exsoftware.container",
                 "container_protocol_version": 1,
+                "ole_protocol": "exsoftware.ole",
+                "ole_protocol_version": 1,
             },
             "recursion": limits.to_dict(),
             "recursion_events": list(inv.limit_events),

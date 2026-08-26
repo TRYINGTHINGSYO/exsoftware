@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..analyzers.hashes import _digest_path
+from ..content import digest_path
 from ..context import AnalysisContext
 
 try:
@@ -81,7 +81,7 @@ def parent_context_extra(
         if snap:
             extra["filesystem_snapshot"] = snap
         if ctx.truncated:
-            extra["full_file_hashes"] = _digest_path(ctx.path)
+            extra["full_file_hashes"] = digest_path(ctx.path)
             extra["hash_coverage"] = "full-file"
         else:
             extra["hash_coverage"] = "full-file"

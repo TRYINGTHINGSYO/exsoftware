@@ -1,41 +1,8 @@
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
+from ..content import digest_bytes, digest_path
 from ..models import Evidence, Finding
 from .base import Analyzer
-
-
-def _digest_bytes(data: bytes) -> dict[str, str]:
-    return {
-        "md5": hashlib.md5(data).hexdigest(),
-        "sha1": hashlib.sha1(data).hexdigest(),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "sha512": hashlib.sha512(data).hexdigest(),
-    }
-
-
-def _digest_path(path: Path) -> dict[str, str]:
-    md5 = hashlib.md5()
-    sha1 = hashlib.sha1()
-    sha256 = hashlib.sha256()
-    sha512 = hashlib.sha512()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            md5.update(chunk)
-            sha1.update(chunk)
-            sha256.update(chunk)
-            sha512.update(chunk)
-    return {
-        "md5": md5.hexdigest(),
-        "sha1": sha1.hexdigest(),
-        "sha256": sha256.hexdigest(),
-        "sha512": sha512.hexdigest(),
-    }
 
 
 class HashAnalyzer(Analyzer):
@@ -48,7 +15,7 @@ class HashAnalyzer(Analyzer):
         parent_hashes = extra.get("full_file_hashes")
         coverage_hint = extra.get("hash_coverage")
         if ctx.truncated and ctx.source == "bytes" and not parent_hashes:
-            hashes = _digest_bytes(ctx.data)
+            hashes = digest_bytes(ctx.data)
             coverage = "truncated-buffer"
             findings.append(
                 Finding(
@@ -77,10 +44,10 @@ class HashAnalyzer(Analyzer):
             hashes = dict(parent_hashes)
             coverage = coverage_hint or "full-file"
         elif ctx.path is not None:
-            hashes = _digest_path(ctx.path)
+            hashes = digest_path(ctx.path)
             coverage = "full-file"
         else:
-            hashes = _digest_bytes(ctx.data)
+            hashes = digest_bytes(ctx.data)
             coverage = coverage_hint or ("truncated-buffer" if ctx.truncated else "full-buffer")
 
         if ctx.truncated and (ctx.source == "path" or parent_hashes):

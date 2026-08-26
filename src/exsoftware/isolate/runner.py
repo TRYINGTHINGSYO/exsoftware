@@ -9,7 +9,6 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from ..analyzers.base import Analyzer
 from ..content import digest_bytes
 from ..context import AnalysisContext
 from ..limits import RecursionLimits
@@ -54,8 +53,8 @@ class IsolatedAnalyzerRunner:
         self.limits = limits or RecursionLimits()
         self.policy_template = IsolationPolicy.from_limits(self.limits)
 
-    def run(self, analyzer: Analyzer | type[Analyzer], ctx: AnalysisContext, *, timeout: float) -> AnalyzerResult:
-        cls = analyzer if isinstance(analyzer, type) else type(analyzer)
+    def run(self, analyzer: Any, ctx: AnalysisContext, *, timeout: float) -> AnalyzerResult:
+        spec = _analyzer_handle(analyzer)
         started = perf_counter()
         policy = IsolationPolicy.from_limits(self.limits)
         policy.timeout_seconds = timeout
@@ -76,11 +75,11 @@ class IsolatedAnalyzerRunner:
             isolation["workdir"] = str(workdir)
             (workdir / INPUT_NAME).write_bytes(ctx.data)
             digest = digest_bytes(ctx.data)
-            test_mode = os.environ.get(TEST_ENV) == "1" or cls.name.startswith("isolate_test.")
+            test_mode = os.environ.get(TEST_ENV) == "1" or str(spec.name).startswith("isolate_test.")
             extra = parent_context_extra(ctx, test_mode=test_mode, allowed_test_keys=TEST_EXTRA_KEYS)
             request = request_template(
-                analyzer_id=cls.name,
-                analyzer_version=cls.version,
+                analyzer_id=spec.name,
+                analyzer_version=spec.version,
                 artifact_id=ctx.artifact_id or "",
                 input_path=INPUT_NAME,
                 input_sha256=digest["sha256"],
@@ -125,7 +124,7 @@ class IsolatedAnalyzerRunner:
             }
             if rc is None:
                 result = _status_result(
-                    cls,
+                    spec,
                     status="timeout",
                     reason=REASON_TIMEOUT,
                     message=f"Analyzer exceeded {timeout} seconds and was terminated.",
@@ -135,9 +134,9 @@ class IsolatedAnalyzerRunner:
                         "returncode": proc.returncode,
                     },
                 )
-                return _finish(result, cls, ctx, isolation, started)
+                return _finish(result, spec, ctx, isolation, started)
             isolation["returncode"] = rc
-            return _finish(self._read_response(cls, ctx, workdir, rc), cls, ctx, isolation, started)
+            return _finish(self._read_response(spec, ctx, workdir, rc), spec, ctx, isolation, started)
         except Exception as exc:
             isolation["spawn_error"] = str(exc)
             isolation["traceback"] = traceback.format_exc()
@@ -147,13 +146,13 @@ class IsolatedAnalyzerRunner:
             except Exception:
                 pass
             result = _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=REASON_SPAWN_FAILED,
                 message=str(exc) or exc.__class__.__name__,
                 extra={"exception_type": exc.__class__.__name__},
             )
-            return _finish(result, cls, ctx, isolation, started)
+            return _finish(result, spec, ctx, isolation, started)
         finally:
             if proc is not None:
                 if proc.poll() is None:
@@ -164,7 +163,7 @@ class IsolatedAnalyzerRunner:
 
     def _read_response(
         self,
-        cls: type[Analyzer],
+        spec: Any,
         ctx: AnalysisContext,
         workdir: Path,
         returncode: int,
@@ -173,7 +172,7 @@ class IsolatedAnalyzerRunner:
             raw = read_workspace_file(workdir, RESPONSE_NAME, max_bytes=self.limits.max_result_bytes)
         except OversizedWorkspaceFile as exc:
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=REASON_OVERSIZED,
                 message=str(exc),
@@ -187,7 +186,7 @@ class IsolatedAnalyzerRunner:
             message = str(exc)
             if "reparse" in message or "symlink" in message or "escaped" in message:
                 return _status_result(
-                    cls,
+                    spec,
                     status="failed",
                     reason=REASON_INVALID_RESPONSE,
                     message=f"Refused to read child response: {exc}",
@@ -195,7 +194,7 @@ class IsolatedAnalyzerRunner:
                 )
             reason = REASON_CHILD_CRASH if _looks_like_crash(returncode) else REASON_CHILD_EXIT
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=reason,
                 message=f"Analyzer child exited without a readable response (returncode={returncode}).",
@@ -203,7 +202,7 @@ class IsolatedAnalyzerRunner:
             )
         if not raw:
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=REASON_EMPTY_RESPONSE,
                 message="Analyzer child wrote an empty response.",
@@ -211,7 +210,7 @@ class IsolatedAnalyzerRunner:
             )
         if len(raw) > self.limits.max_result_bytes:
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=REASON_OVERSIZED,
                 message=f"Analyzer child response was {len(raw)} bytes; limit is {self.limits.max_result_bytes} bytes.",
@@ -221,7 +220,7 @@ class IsolatedAnalyzerRunner:
             data = json.loads(raw.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=REASON_INVALID_RESPONSE,
                 message=f"Analyzer child response was not valid JSON ({exc}).",
@@ -230,13 +229,13 @@ class IsolatedAnalyzerRunner:
         try:
             validate_response(
                 data,
-                analyzer_id=cls.name,
-                analyzer_version=cls.version,
+                analyzer_id=spec.name,
+                analyzer_version=spec.version,
                 artifact_id=ctx.artifact_id or "",
             )
         except ProtocolError as exc:
             return _status_result(
-                cls,
+                spec,
                 status="failed",
                 reason=exc.code,
                 message=str(exc),
@@ -249,16 +248,25 @@ class IsolatedAnalyzerRunner:
         return result
 
 
+def _analyzer_handle(analyzer: Any) -> Any:
+    """Normalize AnalyzerSpec, analyzer class, or analyzer instance to a metadata handle."""
+    if isinstance(analyzer, type):
+        return analyzer
+    if callable(getattr(analyzer, "analyze", None)):
+        return type(analyzer)
+    return analyzer
+
+
 def _finish(
     result: AnalyzerResult,
-    cls: type[Analyzer],
+    spec: Any,
     ctx: AnalysisContext,
     isolation: dict[str, Any],
     started: float,
 ) -> AnalyzerResult:
-    result.name = cls.name
-    result.title = cls.title
-    result.analyzer_version = cls.version
+    result.name = spec.name
+    result.title = getattr(spec, "title", spec.name)
+    result.analyzer_version = spec.version
     result.artifact_id = ctx.artifact_id
     result.duration_ms = (perf_counter() - started) * 1000
     details = dict(result.details or {})
@@ -266,7 +274,7 @@ def _finish(
     details["isolation"] = isolation
     if isinstance(child_iso, dict):
         details["isolation"]["child_claimed"] = child_iso
-    if cls.name == "filesystem" and ctx.path is not None:
+    if spec.name == "filesystem" and ctx.path is not None:
         details.setdefault("path", str(ctx.path))
         details.setdefault("absolute_path", str(ctx.path.resolve()))
     result.details = details
@@ -274,7 +282,7 @@ def _finish(
 
 
 def _status_result(
-    cls: type[Analyzer],
+    spec: Any,
     *,
     status: str,
     reason: str,
@@ -285,15 +293,15 @@ def _status_result(
     if status == "timeout":
         details.setdefault("result", "not analyzed")
     return AnalyzerResult(
-        name=cls.name,
-        title=cls.title,
+        name=spec.name,
+        title=getattr(spec, "title", spec.name),
         applies=True,
         status=status,  # type: ignore[arg-type]
-        analyzer_version=cls.version,
+        analyzer_version=spec.version,
         details=details,
         errors=[
             AnalyzerError(
-                analyzer=cls.name,
+                analyzer=spec.name,
                 message=message,
                 exception_type={"timeout": "TimeoutError", "terminated": "TerminatedError"}.get(
                     status, "AnalyzerIsolationError"
