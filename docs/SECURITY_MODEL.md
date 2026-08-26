@@ -68,7 +68,7 @@ This is **not** a sandbox in the malware-analysis sense. There is no guest OS, n
 - A child that can still spawn (degraded process_creation) may race the timeout
 - Network restriction is OS-specific; if it is `unsupported` or `degraded`, sockets may work
 - Python runtime files must remain readable to the child. On Windows this is a **user-owned staged CPython tree** plus the ExSoftware `src` tree and the active venv `site-packages`. Those paths are intentionally reachable.
-- AppContainer does **not** block bind/listen on loopback on the Windows build used for Stage 4. Outbound connect is blocked. `network_restriction` is therefore `degraded`.
+- AppContainer with zero network capabilities blocks outbound connect. Bind/listen on loopback may still succeed at the Winsock API. That is **not** the same as a usable host↔worker communication path: Windows Filtering Platform loopback isolation typically prevents non-AppContainer processes from exchanging traffic with an AppContainer listener unless a CheckNetIsolation loopback exemption is configured. `exsoftware security-status` now probes host→worker connect/accept (IPv4/IPv6), outbound connect, and UDP send, and only reports `network_restriction=enforced` when usable communication probes fail. Per-run analyzer capability claims remain `degraded` until that live evidence is collected. This cloud/CI documentation must not be read as a substitute for a real Windows `security-status` run.
 - AppContainer/restricted-token setup can fail; the engine must then report `unsupported`/`degraded` rather than pretend
 - A Job Object `ActiveProcessLimit=1` prevents creating a descendant; it does not prevent in-process thread creation or using already-loaded Win32 APIs
 
@@ -111,14 +111,18 @@ Primary mechanism, when `TokenIsAppContainer` is confirmed on the live child:
 - **ACL-scoped workspace** (current-user owner + AppContainer SID)
 - **Staged CPython** under `%TEMP%\exsoftware-isolate\runtime` because a non-elevated parent cannot add AppContainer ACEs to a machine-wide `C:\Python314` tree
 
-Observed on this host:
+Observed on the Stage 4 Windows development host (historical; re-verify with `exsoftware security-status` after probe changes):
 
 - Host sentinel **read** → `Permission denied`
 - Host sentinel **write** → `Permission denied`
 - Outbound connect to TEST-NET (`192.0.2.1`) → `WSAEACCES` (10013)
 - Localhost **connect** → timed out (loopback isolation)
-- Localhost **bind/listen** → **still succeeds** → `network_restriction` is **degraded**, not enforced
+- Localhost **bind/listen** → Winsock API **succeeds** (creating a listening socket is not the same as receiving host traffic)
+- Host→worker connect/accept → must be measured by the updated security-status probe; do not assume bind success implies a usable channel
+- IPv6 (`::1` / `2001:db8::1`) and UDP send probes are included in security-status so a TCP/IPv4-only reading is not mistaken for full network isolation
 - `CreateProcess` of a descendant → `ERROR_NOT_ENOUGH_QUOTA` (1816) from `ActiveProcessLimit=1`
+
+Per-run AppContainer launches still record `network_restriction=degraded` because bind may succeed and a per-analyzer host→worker probe is not repeated on every file. `security-status` may report `enforced` only when live communication probes deny usable traffic.
 
 Fallback if AppContainer launch fails: restricted token + Low integrity (needs `SeImpersonatePrivilege`; often unavailable) then job-only (filesystem/network **unsupported**).
 

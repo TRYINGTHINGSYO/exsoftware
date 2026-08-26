@@ -44,6 +44,9 @@ TEST_EXTRA_KEYS = frozenset(
         "sentinel_write",
         "probe_host",
         "probe_port",
+        "probe_host_v6",
+        "probe_port_v6",
+        "listen_accept_seconds",
     }
 )
 

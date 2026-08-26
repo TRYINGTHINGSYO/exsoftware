@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from ..analyzers.base import Analyzer
 
@@ -168,10 +169,17 @@ class IsolateNetworkAnalyzer(Analyzer):
         extra = ctx.extra or {}
         host = extra.get("probe_host") or "127.0.0.1"
         port = int(extra.get("probe_port") or 1)
-        details = {
+        host_v6 = extra.get("probe_host_v6") or "::1"
+        port_v6 = extra.get("probe_port_v6")
+        details: dict = {
             "connect_ok": False,
+            "connect_v6_ok": False,
             "listen_ok": False,
+            "listen_v6_ok": False,
             "external_connect_ok": False,
+            "external_connect_v6_ok": False,
+            "udp_send_ok": False,
+            "udp_send_v6_ok": False,
             "denied": False,
         }
         try:
@@ -181,19 +189,172 @@ class IsolateNetworkAnalyzer(Analyzer):
         except OSError as exc:
             details["denied"] = True
             details["connect_error"] = str(exc)
+            details["connect_errno"] = getattr(exc, "errno", None)
+            details["connect_winerror"] = getattr(exc, "winerror", None)
+        if port_v6 is not None:
+            try:
+                with socket.create_connection((host_v6, int(port_v6)), timeout=1.0) as sock:
+                    sock.sendall(b"x")
+                details["connect_v6_ok"] = True
+            except OSError as exc:
+                details["connect_v6_error"] = str(exc)
+                details["connect_v6_errno"] = getattr(exc, "errno", None)
+                details["connect_v6_winerror"] = getattr(exc, "winerror", None)
         try:
             with socket.create_connection(("192.0.2.1", 80), timeout=1.0):
                 details["external_connect_ok"] = True
         except OSError as exc:
             details["external_connect_error"] = str(exc)
+            details["external_connect_errno"] = getattr(exc, "errno", None)
+            details["external_connect_winerror"] = getattr(exc, "winerror", None)
+        try:
+            with socket.create_connection(("2001:db8::1", 80), timeout=1.0):
+                details["external_connect_v6_ok"] = True
+        except OSError as exc:
+            details["external_connect_v6_error"] = str(exc)
+            details["external_connect_v6_errno"] = getattr(exc, "errno", None)
+            details["external_connect_v6_winerror"] = getattr(exc, "winerror", None)
+        try:
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                udp.settimeout(1.0)
+                udp.sendto(b"exsoftware-udp-probe", ("192.0.2.1", 53))
+                details["udp_send_ok"] = True
+            finally:
+                udp.close()
+        except OSError as exc:
+            details["udp_send_error"] = str(exc)
+            details["udp_send_errno"] = getattr(exc, "errno", None)
+            details["udp_send_winerror"] = getattr(exc, "winerror", None)
+        try:
+            udp6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            try:
+                udp6.settimeout(1.0)
+                udp6.sendto(b"exsoftware-udp-probe", ("2001:db8::1", 53))
+                details["udp_send_v6_ok"] = True
+            finally:
+                udp6.close()
+        except OSError as exc:
+            details["udp_send_v6_error"] = str(exc)
+            details["udp_send_v6_errno"] = getattr(exc, "errno", None)
+            details["udp_send_v6_winerror"] = getattr(exc, "winerror", None)
         try:
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.bind(("127.0.0.1", 0))
             srv.listen(1)
             details["listen_ok"] = True
+            details["listen_port"] = srv.getsockname()[1]
             srv.close()
         except OSError as extra_exc:
             details["listen_error"] = str(extra_exc)
+            details["listen_errno"] = getattr(extra_exc, "errno", None)
+            details["listen_winerror"] = getattr(extra_exc, "winerror", None)
+        try:
+            srv6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            try:
+                if hasattr(socket, "IPV6_V6ONLY"):
+                    srv6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                srv6.bind(("::1", 0))
+                srv6.listen(1)
+                details["listen_v6_ok"] = True
+                details["listen_v6_port"] = srv6.getsockname()[1]
+            finally:
+                srv6.close()
+        except OSError as extra_exc:
+            details["listen_v6_error"] = str(extra_exc)
+            details["listen_v6_errno"] = getattr(extra_exc, "errno", None)
+            details["listen_v6_winerror"] = getattr(extra_exc, "winerror", None)
+        return self.result(details=details)
+
+
+class IsolateNetworkListenAnalyzer(Analyzer):
+    """Bind/listen and wait for an outside accept — used with a parent mid-flight connect.
+
+    Writes ``network_listen_ready.json`` in the isolate workdir before accepting so
+    the trusted parent can attempt a real host→worker connection.
+    """
+
+    name = "isolate_test.network_listen"
+    title = "Test: listen and accept"
+    version = "1.0.0"
+
+    def analyze(self, ctx):
+        import json
+        import socket
+
+        from ..isolate.protocol import WORKDIR_ENV
+
+        extra = ctx.extra or {}
+        wait_seconds = float(extra.get("listen_accept_seconds") or 6.0)
+        workdir = os.environ.get(WORKDIR_ENV)
+        details: dict = {
+            "listen_ok": False,
+            "listen_v6_ok": False,
+            "accept_ok": False,
+            "accept_v6_ok": False,
+            "ready_written": False,
+            "endpoints": [],
+        }
+        servers: list[tuple[Any, str, str, int]] = []
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = int(srv.getsockname()[1])
+            servers.append((srv, "ipv4", "127.0.0.1", port))
+            details["listen_ok"] = True
+            details["listen_port"] = port
+            details["endpoints"].append({"family": "ipv4", "host": "127.0.0.1", "port": port})
+        except OSError as exc:
+            details["listen_error"] = str(exc)
+            details["listen_errno"] = getattr(exc, "errno", None)
+            details["listen_winerror"] = getattr(exc, "winerror", None)
+        try:
+            srv6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            if hasattr(socket, "IPV6_V6ONLY"):
+                srv6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            srv6.bind(("::1", 0))
+            srv6.listen(1)
+            port6 = int(srv6.getsockname()[1])
+            servers.append((srv6, "ipv6", "::1", port6))
+            details["listen_v6_ok"] = True
+            details["listen_v6_port"] = port6
+            details["endpoints"].append({"family": "ipv6", "host": "::1", "port": port6})
+        except OSError as exc:
+            details["listen_v6_error"] = str(exc)
+            details["listen_v6_errno"] = getattr(exc, "errno", None)
+            details["listen_v6_winerror"] = getattr(exc, "winerror", None)
+
+        if workdir and details["endpoints"]:
+            ready_path = Path(workdir) / "network_listen_ready.json"
+            ready_path.write_text(
+                json.dumps({"tcp": details["endpoints"]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            details["ready_written"] = True
+
+        per_socket_wait = max(0.5, wait_seconds / max(len(servers), 1))
+        for srv, family, _host, _port in servers:
+            try:
+                srv.settimeout(per_socket_wait)
+                conn, peer = srv.accept()
+                try:
+                    if family == "ipv6":
+                        details["accept_v6_ok"] = True
+                        details["accept_v6_peer"] = str(peer)
+                    else:
+                        details["accept_ok"] = True
+                        details["accept_peer"] = str(peer)
+                finally:
+                    conn.close()
+            except OSError as exc:
+                key = "accept_v6_error" if family == "ipv6" else "accept_error"
+                details[key] = str(exc)
+            finally:
+                try:
+                    srv.close()
+                except OSError:
+                    pass
         return self.result(details=details)
 
 
@@ -327,6 +488,7 @@ TEST_ANALYZERS: list[type[Analyzer]] = [
     IsolateReadOutsideAnalyzer,
     IsolateWriteOutsideAnalyzer,
     IsolateNetworkAnalyzer,
+    IsolateNetworkListenAnalyzer,
     IsolateSpawnAnalyzer,
     IsolateStdoutFloodAnalyzer,
     IsolateStderrFloodAnalyzer,
