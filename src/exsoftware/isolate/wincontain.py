@@ -643,15 +643,18 @@ def apply_policy_from_launch(policy: IsolationPolicy, meta: dict[str, Any], job:
         policy.reasons["process_tree_limit"] = "Job Object was not assigned; relying on taskkill /T"
     if policy.mechanism == "appcontainer" and meta.get("token_is_appcontainer"):
         policy.filesystem_restriction = "enforced"
-        # Outbound connect is blocked without network capabilities, but this
-        # host still allows bind/listen on loopback. Do not report enforced.
+        # Zero network capabilities block outbound connect. Bind/listen on loopback
+        # may still succeed at the Winsock API; usable host↔worker loopback traffic
+        # is a separate WFP property. Per-run claims stay degraded until
+        # security-status live probes confirm communication denial.
         policy.network_restriction = "degraded"
         policy.reasons["filesystem_restriction"] = (
             "AppContainer token confirmed; host files outside granted paths return Permission denied"
         )
         policy.reasons["network_restriction"] = (
-            "AppContainer with zero network capabilities; outbound connect is blocked, "
-            "but bind/listen on loopback still succeeds on this Windows build"
+            "AppContainer with zero network capabilities; outbound connect is blocked. "
+            "Bind/listen may still succeed; usable host↔worker loopback requires separate "
+            "live evidence (see security-status host→worker probe)"
         )
     elif policy.mechanism == "appcontainer":
         policy.filesystem_restriction = "degraded"
