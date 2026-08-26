@@ -222,4 +222,8 @@ OLE identity subtype refinement uses the same worker entrypoint and Stage 4 spaw
 }
 ```
 
-`streams` are length/count-capped strings. The parent classifies doc/xls/ppt/msi/msg with `refine_ole_type_from_streams`. On non-completed status, identity stays `ole` and no in-process olefile fallback runs.
+`streams` are length/count-capped strings. Before invoking `olefile`, the child
+checks that `input.bin` matches the request `size` and `sha256`; mismatches
+fail the operation without parsing. The parent classifies doc/xls/ppt/msi/msg
+with `refine_ole_type_from_streams`. On non-completed status, identity stays
+`ole` and no in-process olefile fallback runs.

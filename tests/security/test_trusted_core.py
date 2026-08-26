@@ -137,13 +137,16 @@ assert not bad, bad
 assert "olefile" not in sys.modules
 print("ok")
 """
+    import os
+
+    env = os.environ.copy()
+    env.pop("EXSOFTWARE_ISOLATE_TEST", None)
     result = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
         capture_output=True,
         text=True,
-        cwd="/workspace",
-        env={**dict(**{k: v for k, v in __import__("os").environ.items() if k != "EXSOFTWARE_ISOLATE_TEST"})},
+        env=env,
     )
     assert "ok" in result.stdout
 
@@ -320,3 +323,65 @@ def test_existing_python_analysis_still_compatible():
     assert report.root_artifact_id.startswith("sha256:")
     assert any(item.analyzer_id == "script" and item.status == "completed" for item in report.analyzer_runs)
     assert any(item.status == "unsupported" and item.analyzer_id == "pe" for item in report.analyzer_runs)
+
+
+def test_ole_refine_rejects_input_size_mismatch(tmp_path):
+    from exsoftware.content import sha256_hex
+    from exsoftware.isolate.ole_refine import run_refine
+
+    data = _build_ole({"WordDocument": b"fixture-doc" * 8})
+    (tmp_path / "input.bin").write_bytes(data)
+    request = {
+        "input": {
+            "kind": "file",
+            "path": "input.bin",
+            "sha256": sha256_hex(data),
+            "size": len(data) + 1,
+        }
+    }
+    body = run_refine(request, tmp_path)
+    assert body["status"] == "failed"
+    assert body["is_ole"] is False
+    assert body["streams"] == []
+    assert body["errors"][0]["code"] == "input_size_mismatch"
+
+
+def test_ole_refine_rejects_input_hash_mismatch(tmp_path):
+    from exsoftware.isolate.ole_refine import run_refine
+
+    data = _build_ole({"WordDocument": b"fixture-doc" * 8})
+    (tmp_path / "input.bin").write_bytes(data)
+    request = {
+        "input": {
+            "kind": "file",
+            "path": "input.bin",
+            "sha256": "0" * 64,
+            "size": len(data),
+        }
+    }
+    body = run_refine(request, tmp_path)
+    assert body["status"] == "failed"
+    assert body["is_ole"] is False
+    assert body["streams"] == []
+    assert body["errors"][0]["code"] == "input_hash_mismatch"
+
+
+def test_registry_matches_analyzer_implementation_metadata():
+    """Maintenance check: registry must not drift from implementation classes.
+
+    This test intentionally imports analyzer implementations. Trusted-parent
+    execution still must not.
+    """
+    from exsoftware.analyzers.loader import load_analyzer_class
+    from exsoftware.analyzers.registry import all_specs
+
+    for spec in all_specs():
+        cls = load_analyzer_class(spec)
+        assert cls.name == spec.name, spec.name
+        assert getattr(cls, "version", "1.0.0") == spec.version, spec.name
+        assert getattr(cls, "title", cls.name) == spec.title, spec.name
+        assert getattr(cls, "detected_types", None) == spec.detected_types, spec.name
+        assert getattr(cls, "detected_families", None) == spec.detected_families, spec.name
+        assert getattr(cls, "timeout_seconds", None) == spec.timeout_seconds, spec.name
+        assert cls.__module__ == spec.worker_module, spec.name
+        assert cls.__name__ == spec.worker_class, spec.name
