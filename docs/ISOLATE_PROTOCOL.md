@@ -182,3 +182,44 @@ Statuses: `extracted`, `directory`, `encrypted`, `path_traversal`, `malformed`, 
 The parent opens only `workdir/blobs/<slot>.bin` with no-follow checks, streams hashes from the fd, then reads the bytes. Child-supplied hashes and paths are ignored.
 
 There is **no OS disk quota**. `max_workspace_bytes` is enforced on actual copied bytes by the child and re-checked by the parent. A child can still write extra junk files in the workspace until timeout; the parent will not ingest them.
+
+## OLE refine protocol (`exsoftware.ole`)
+
+OLE identity subtype refinement uses the same worker entrypoint and Stage 4 spawn path, with protocol `exsoftware.ole`. Child output is hostile. The parent never opens a child-supplied filesystem path.
+
+### Request
+
+```json
+{
+  "protocol": "exsoftware.ole",
+  "protocol_version": 1,
+  "operation": "refine",
+  "artifact_id": "sha256:…",
+  "input": {"kind": "file", "path": "input.bin", "sha256": "…", "size": 123},
+  "limits": {
+    "timeout_seconds": 60,
+    "max_result_bytes": 16777216,
+    "max_memory_bytes": 1073741824,
+    "max_cpu_seconds": 60,
+    "max_child_processes": 1
+  }
+}
+```
+
+### Response (validated subset)
+
+```json
+{
+  "protocol": "exsoftware.ole",
+  "protocol_version": 1,
+  "operation": "refine",
+  "artifact_id": "sha256:…",
+  "status": "completed",
+  "is_ole": true,
+  "streams": ["/WordDocument"],
+  "errors": [],
+  "timing": {"duration_ms": 12.3}
+}
+```
+
+`streams` are length/count-capped strings. The parent classifies doc/xls/ppt/msi/msg with `refine_ole_type_from_streams`. On non-completed status, identity stays `ole` and no in-process olefile fallback runs.

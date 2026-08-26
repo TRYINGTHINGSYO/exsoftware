@@ -14,6 +14,7 @@ TRUSTED CORE
     ├── bounded input acquisition
     ├── streaming hash
     ├── lightweight identification (magic / prefix)
+    ├── declarative analyzer registry (no impl imports)
     ├── orchestration
     ├── protocol validation
     └── investigation graph
@@ -21,6 +22,7 @@ TRUSTED CORE
             ▼
 CONTAINED WORKERS
     ├── ZIP enumeration + extraction
+    ├── OLE stream listing (identity refine)
     ├── PE / PDF / OLE / image / script parsers
     └── analyzer implementations
 ```
@@ -37,20 +39,21 @@ CONTAINED WORKERS
 | Text/JSON/shebang heuristics | yes | bounded prefix, `json.loads` on ≤8 KiB text |
 | ZIP central directory / member extract | **no** | contained worker (`exsoftware.container`) |
 | ZIP subtype from **validated member names** | yes | string prefix checks, not ZIP parsing |
+| OLE stream listing (`olefile`) | **no** | contained worker (`exsoftware.ole`) |
+| OLE subtype from **validated stream names** | yes | string checks, not OLE parsing |
 | PE parsing (`pefile`) | **no** | analyzer child |
 | PDF (`pypdf`) | **no** | analyzer child |
-| OLE (`olefile`) in `identify._refine_ole` | **yes, remaining** | complex parser still in parent identify |
 | Archive listing (`zipfile` / `tarfile`) | **no** | `ArchiveAnalyzer` child |
 | Protocol JSON parse | yes | schema-validated, size-capped |
 | Blob open `blobs/NNNNNN.bin` | yes | parent-computed name, `O_NOFOLLOW` |
 
 ## `identify_bytes` decision
 
-Kept in the trusted parent **except** ZIP refinement.
+Kept in the trusted parent **except** ZIP and OLE refinement that need format parsers.
 
 - Magic table, PE signature, RIFF, shebang, and text heuristics are small and deterministic.
 - ZIP family subtype (jar/apk/docx/…) is **not** decided with `zipfile` in the parent. PK magic yields `zip`; a contained container worker lists members **before analyzers run**; the parent classifies from **names only**.
-- **OLE refinement still uses `olefile` in the parent.** That is remaining trusted-core complexity, documented here. Stage 5 moved ZIP, not OLE.
+- OLE magic yields `ole` with `ole_subtype_pending`. A contained OLE worker lists streams; the parent classifies doc/xls/ppt/msi/msg from **names only**. Worker failure leaves type as `ole` and records `ole_refinement` without a parent-side olefile fallback.
 
 ## Container worker guarantee
 
@@ -59,6 +62,12 @@ Kept in the trusted parent **except** ZIP refinement.
 - The parent hashes blob fds itself. Child SHA-256 is ignored.
 - Limits use **actual written bytes**, not ZIP header uncompressed sizes.
 - There is **no OS disk quota**. The budget is enforced by the child copy loop and re-checked by the parent when opening blobs. A child can still write extra junk files in the workspace until timeout; the parent will not ingest them.
+
+## OLE refine worker guarantee
+
+- `olefile` runs only in the isolated OLE refine worker.
+- The parent receives validated stream-name strings (length/count capped) and optional `is_ole`.
+- On worker failure/timeout/invalid response, identity stays `ole` and `extra.ole_refinement` records the failure. The engine does not claim a refined subtype and does not parse OLE in-process as a fallback.
 
 ## Reparse / path guarantee
 
@@ -72,4 +81,4 @@ Parent blob open:
 
 ## Analyzer imports
 
-The trusted parent still imports analyzer implementation modules to read `detected_types` / `detected_families`. Module-level code in those files runs in the parent. See [ARCHITECTURE_DEBT.md](ARCHITECTURE_DEBT.md).
+The trusted parent reads `AnalyzerSpec` entries from `exsoftware.analyzers.registry`. It does not import analyzer implementation modules to learn eligibility. Workers import one implementation module when executing that analyzer. See [ARCHITECTURE_DEBT.md](ARCHITECTURE_DEBT.md) for remaining non-import debts.

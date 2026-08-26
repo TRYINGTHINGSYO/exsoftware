@@ -14,6 +14,7 @@ HOST / TRUSTED ENGINE
         ▼
 LEAST-PRIVILEGE WORKERS
   ZIP-family enumeration/extraction (exsoftware.container)
+  OLE stream listing for identity refine (exsoftware.ole)
   Analyzer.applies / Analyzer.analyze (exsoftware.isolate)
   third-party parsers (pefile, pypdf, Pillow, olefile, zipfile, …)
         │
@@ -26,13 +27,13 @@ HOSTILE BYTES
 ### Trusted
 
 - Main ExSoftware engine (pipeline, investigation graph construction)
-- Declarative analyzer eligibility (`detected_types` / `detected_families` class attributes)
+- Declarative analyzer registry (`AnalyzerSpec`: id/version/title, detected types/families, worker module/class identifiers)
 - Result validation (`exsoftware.isolate.validate`)
 - Workspace creation, process launch, timeout/kill, bounded stdio
 
 ### Partially trusted / untrusted
 
-- Analyzer implementations (treated as compromiseable)
+- Analyzer implementations (treated as compromiseable; imported only inside workers)
 - Third-party parser libraries running in the child
 
 ### Completely hostile
@@ -61,7 +62,7 @@ This is **not** a sandbox in the malware-analysis sense. There is no guest OS, n
 - Bugs in the isolation implementation (AppContainer launch, ACL grants, Landlock apply)
 - Files that are readable to `Everyone` / `Users` / `ALL APPLICATION PACKAGES` when only a restricted token is in use
 - Side channels (timing, memory pressure below the job limit)
-- The trusted parent still **loads and identifies** hostile bytes. ZIP-family listing/extraction is **not** done with parent-side `zipfile`; it runs in a contained container worker. OLE refinement in `identify._refine_ole` still uses `olefile` in the parent.
+- The trusted parent still **loads and identifies** hostile bytes. ZIP-family listing/extraction is **not** done with parent-side `zipfile`; it runs in a contained container worker. OLE stream listing for subtype refinement is **not** done with parent-side `olefile`; it runs in a contained OLE worker. The parent classifies OLE subtype from validated stream **names** only.
 - `identify_bytes` magic matching runs in the parent on the analysis buffer
 - Full-file hashing of a truncated path sample runs in the parent
 - A child that can still spawn (degraded process_creation) may race the timeout
@@ -79,12 +80,12 @@ These still execute in the trusted process:
 | --- | --- |
 | `context.load_from_path` / `load_from_bytes` | Must read the sample (capped) |
 | `identify.identify_bytes` | Magic/prefix detection on the analysis buffer |
-| `identify._refine_ole` | Remaining: `olefile` still runs in the parent |
+| `identify.refine_ole_type_from_streams` | String classification of **validated** OLE stream names |
 | `identify.refine_zip_type_from_names` | String classification of **validated** member names |
-| `content.sha256_file` / `digest_fd` | Streaming identity of the original file and extracted blobs |
+| `content.sha256_file` / `digest_fd` / `digest_path` | Streaming identity of the original file and extracted blobs |
 | container blob open `blobs/NNNNNN.bin` | Parent-computed slot, `O_NOFOLLOW`, independently hashed |
 
-Format parsers (`pefile`, `pypdf`, …) must not run in the parent.
+Format parsers (`pefile`, `pypdf`, `olefile`, `zipfile`, …) must not run in the parent.
 
 ## Capability states
 

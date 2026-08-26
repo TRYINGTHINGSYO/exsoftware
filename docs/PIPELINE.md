@@ -6,8 +6,9 @@ ExSoftware analyzes a file with **static, local, deterministic** methods. It doe
 file
   -> load (path or bytes, size-capped)
   -> content-addressed artifact (SHA-256)
-  -> identify (magic / prefix; PK -> zip)
+  -> identify (magic / prefix; PK -> zip; OLE magic -> ole pending)
   -> contained ZIP listing/extraction (if ZIP-family)
+  -> contained OLE stream listing (if OLE pending)
   -> analyzers (each independently, per artifact, in an isolated child process)
   -> observations + evidence + findings + relationships
   -> derived composition report (no extra parsing)
@@ -28,13 +29,13 @@ The file is never launched as a process.
 
 ## Identify
 
-`exsoftware.identify.identify_bytes` matches known magics, then refines OLE/RIFF/text in-process. PK magic yields `zip`; ZIP subtype (jar/apk/docx/…) is decided later from **contained listing names**, not by parent-side `zipfile`. The claimed extension is compared to the detected type. A mismatch is a **derived** finding, not a silent correction.
+`exsoftware.identify.identify_bytes` matches known magics, then refines RIFF/text in-process. PK magic yields `zip`; ZIP subtype (jar/apk/docx/…) is decided later from **contained listing names**, not by parent-side `zipfile`. OLE magic yields `ole`; subtype (doc/xls/…) is decided later from **contained OLE stream names**, not by parent-side `olefile`. The claimed extension is compared to the detected type. A mismatch is a **derived** finding, not a silent correction.
 
 ## Analyzers
 
-Each analyzer has `name`, `version`, `applies(ctx)`, and `analyze(ctx)`. Register in `exsoftware.analyzers.ANALYZERS`.
+Each analyzer has `name`, `version`, `applies(ctx)`, and `analyze(ctx)`. Register a declarative `AnalyzerSpec` in `exsoftware.analyzers.registry` (worker module/class identifiers plus eligibility metadata). Do not require the trusted parent to import the implementation module.
 
-The trusted parent selects analyzers from **class attributes** (`detected_types`, `detected_families`) via `is_eligible`. It does not instantiate analyzers and does not call `applies()` or `analyze()`. Those methods run only in the isolated child.
+The trusted parent selects analyzers from the registry via `is_eligible`. It does not instantiate analyzers and does not call `applies()` or `analyze()`. Those methods run only in the isolated child, after the worker imports that analyzer’s implementation.
 
 `applies()` in the child is a second check using the same declarative metadata.
 
