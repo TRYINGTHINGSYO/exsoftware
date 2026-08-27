@@ -97,7 +97,12 @@ def _serve(args: argparse.Namespace) -> int:
 def _security_status(args: argparse.Namespace) -> int:
     from .isolate.status import format_status, inspect_isolation
 
-    data = inspect_isolation()
+    progress = None
+    if not args.json:
+        def progress(message: str) -> None:
+            print(message, file=sys.stderr, flush=True)
+
+    data = inspect_isolation(progress=progress)
     if args.json:
         print(json.dumps(data, indent=2, default=str))
     else:

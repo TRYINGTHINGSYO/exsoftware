@@ -24,6 +24,7 @@ if sys.platform != "win32":  # pragma: no cover
     raise ImportError("wincontain is Windows-only")
 
 from . import winjob
+from .acl_prep import PROCESS_ACL_CACHE, apply_cached_grant
 from .policy import IsolationPolicy
 from .winacl import current_user_sid, grant_sid
 
@@ -277,39 +278,63 @@ def appcontainer_sid() -> tuple[str, ctypes.c_void_p]:
 
 
 def prepare_appcontainer_paths(workdir: Path, sid: str) -> list[str]:
-    """Grant the AppContainer SID access to runtime paths it must read."""
+    """Grant the AppContainer SID access to runtime paths it must read.
+
+    The staged interpreter receives an inheritable ACE **before** files are
+    copied, so this function must not recursively ``icacls /T`` that tree.
+    A failed or timed-out grant is cached for the process so later probes do
+    not wait through the same expensive failure again.
+    """
     import tempfile
 
-    granted: list[str] = []
-    if grant_sid(workdir, sid, "(OI)(CI)(F)", recursive=True):
-        granted.append(str(workdir))
-    prefixes: set[Path] = {Path(__file__).resolve().parents[2]}
-    site = Path(sys.prefix).resolve() / "Lib" / "site-packages"
-    if site.exists():
-        prefixes.add(site)
-    try:
-        from .winruntime import ensure_staged_cpython
+    from .winruntime import (
+        acl_sid_marker_name,
+        ensure_staged_cpython,
+        extra_host_site_packages,
+    )
 
-        prefixes.add(ensure_staged_cpython())
-    except OSError:
-        prefixes.add(Path(sys.base_prefix).resolve())
-    cache_root = Path(tempfile.gettempdir()) / "exsoftware-isolate" / "acl-cache"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    sid_key = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]
-    for prefix in prefixes:
-        if not prefix.exists():
-            continue
-        prefix_key = hashlib.sha256(str(prefix).encode("utf-8")).hexdigest()[:16]
-        marker = cache_root / f"{sid_key}-{prefix_key}.done"
-        recursive = prefix not in _GRANTED_PREFIXES and not marker.is_file()
-        if grant_sid(prefix, sid, "(OI)(CI)(RX)", recursive=recursive):
-            granted.append(str(prefix))
-            _GRANTED_PREFIXES.add(prefix)
-            try:
-                marker.write_text("ok", encoding="utf-8")
-            except OSError:
-                pass
-    return granted
+    PROCESS_ACL_CACHE.raise_if_failed()
+    granted: list[str] = []
+    try:
+        if not grant_sid(workdir, sid, "(OI)(CI)(F)", recursive=True):
+            raise OSError(f"failed to grant AppContainer ACE on workspace {workdir}")
+        granted.append(str(workdir))
+        staged = ensure_staged_cpython(appcontainer_sid=sid)
+        prefixes: list[Path] = [staged, *extra_host_site_packages()]
+        cache_root = Path(tempfile.gettempdir()) / "exsoftware-isolate" / "acl-cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        sid_key = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]
+        staged_resolved = staged.resolve()
+        for prefix in prefixes:
+            if not prefix.exists():
+                continue
+            resolved = prefix.resolve()
+            prefix_key = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+            key = f"{sid_key}-{prefix_key}"
+            marker = cache_root / f"{key}.done"
+
+            def do_grant(target: Path = resolved, staged_root: Path = staged_resolved) -> bool:
+                # Staged runtime already inherited the ACE from the empty parent.
+                if target == staged_root and (target / acl_sid_marker_name(sid)).is_file():
+                    return True
+                if target in _GRANTED_PREFIXES:
+                    return True
+                # Never recursively ACL a staged interpreter.
+                recursive = target != staged_root
+                return grant_sid(target, sid, "(OI)(CI)(RX)", recursive=recursive)
+
+            apply_cached_grant(
+                marker=marker,
+                grant_fn=do_grant,
+                cache=PROCESS_ACL_CACHE,
+                key=key,
+            )
+            granted.append(str(resolved))
+            _GRANTED_PREFIXES.add(resolved)
+        return granted
+    except OSError as exc:
+        PROCESS_ACL_CACHE.record_failure(exc)
+        raise
 
 
 def _env_block(env: dict[str, str]) -> bytes:

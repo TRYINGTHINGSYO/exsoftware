@@ -38,10 +38,23 @@ def worker_executable() -> str:
 
 
 def pythonpath_for_child() -> str:
-    src = str(Path(__file__).resolve().parents[2])
-    venv_site = str(Path(sys.prefix) / "Lib" / "site-packages")
-    base_site = str(Path(sys.base_prefix) / "Lib" / "site-packages")
-    parts = [src, venv_site, base_site]
+    parts: list[str]
+    if sys.platform == "win32":
+        from .winruntime import extra_host_site_packages, staged_python_root
+
+        # Staged Lib/site-packages contains a copy of exsoftware plus interpreter
+        # site-packages. Prefer it over the live src tree so AppContainer does not
+        # need an ACE on the developer checkout (often a subst drive).
+        staged_site = staged_python_root() / "Lib" / "site-packages"
+        parts = [str(staged_site)]
+        for site in extra_host_site_packages():
+            if str(site) not in parts:
+                parts.append(str(site))
+    else:
+        src = str(Path(__file__).resolve().parents[2])
+        venv_site = str(Path(sys.prefix) / "Lib" / "site-packages")
+        base_site = str(Path(sys.base_prefix) / "Lib" / "site-packages")
+        parts = [src, venv_site, base_site]
     current = os.environ.get("PYTHONPATH", "")
     for item in current.split(os.pathsep):
         if item and item not in parts:
@@ -67,6 +80,9 @@ def child_env(*, test_mode: bool, workdir: Path) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or r"C:\Windows"
         python_exe = Path(worker_executable()).resolve()
         python_dir = str(python_exe.parent)
+        from .winruntime import child_path_entries
+
+        path_entries = child_path_entries(python_exe)
         env.update(
             {
                 "SystemRoot": system_root,
@@ -75,7 +91,7 @@ def child_env(*, test_mode: bool, workdir: Path) -> dict[str, str]:
                 "PYTHONHOME": python_dir,
                 "PATH": os.pathsep.join(
                     [
-                        python_dir,
+                        *path_entries,
                         str(Path(sys.prefix) / "Scripts"),
                         str(Path(system_root) / "System32"),
                         str(Path(system_root) / "System32" / "Wbem"),

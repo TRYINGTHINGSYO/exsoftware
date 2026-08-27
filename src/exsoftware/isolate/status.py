@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -22,6 +23,15 @@ from .network_capability import (
     probe_host_to_worker_listen,
 )
 from .policy import CAPABILITIES
+from .probe_evidence import (
+    evaluate_filesystem_restriction,
+    evaluate_process_boundary,
+    evaluate_process_creation,
+    normalize_mechanism,
+    probe_worker_launched,
+    reject_os_enforcement_without_mechanism,
+)
+from .protocol import REASON_SPAWN_FAILED
 from .runner import IsolatedAnalyzerRunner
 from .test_analyzers import (
     IsolateNetworkAnalyzer,
@@ -31,8 +41,12 @@ from .test_analyzers import (
 )
 
 
-def inspect_isolation() -> dict[str, Any]:
+def inspect_isolation(*, progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Probe the live OS boundary. Never reports enforced unless the forbidden op failed."""
+    def note(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
     report: dict[str, Any] = {
         "sandbox": False,
         "containment": "static-parser",
@@ -45,10 +59,16 @@ def inspect_isolation() -> dict[str, Any]:
     }
     report["capabilities"]["wall_clock"] = "enforced"
     report["capabilities"]["output_limit"] = "enforced"
-    report["capabilities"]["process_boundary"] = "enforced"
     report["reasons"]["wall_clock"] = "Parent wait + process-tree kill"
     report["reasons"]["output_limit"] = "Bounded stdout/stderr pipes"
-    report["reasons"]["process_boundary"] = "Analyzer work runs in a child process"
+    # process_boundary is decided after probes: a worker that never launched is not a boundary.
+
+    if sys.platform == "win32":
+        note("Checking Windows containment...")
+    elif sys.platform.startswith("linux"):
+        note("Checking Linux containment...")
+    else:
+        note("Checking analyzer containment...")
 
     listener_v4 = None
     listener_v6 = None
@@ -88,12 +108,14 @@ def inspect_isolation() -> dict[str, Any]:
             ctx = load_from_bytes(b"status", name="status.bin")
             ctx.artifact_id = content_id_from_bytes(ctx.data)
 
+            note("filesystem read...")
             read = _run(
                 runner,
                 IsolateReadOutsideAnalyzer,
                 ctx,
                 extra={"sentinel_read": str(secret)},
             )
+            note("filesystem write...")
             write = _run(
                 runner,
                 IsolateWriteOutsideAnalyzer,
@@ -113,7 +135,9 @@ def inspect_isolation() -> dict[str, Any]:
             if udp_socks.get("udp_port_v6") is not None:
                 net_extra["udp_probe_port_v6"] = udp_socks["udp_port_v6"]
                 net_extra["udp_probe_token_v6"] = udp_tokens["udp_probe_token_v6"]
+            note("network...")
             net = _run(runner, IsolateNetworkAnalyzer, ctx, extra=net_extra)
+            note("process creation...")
             spawn = _run(runner, IsolateSpawnAnalyzer, ctx, extra={})
             host_write_exists = write_target.exists()
             listen_comm = probe_host_to_worker_listen(
@@ -166,17 +190,24 @@ def _run(runner, cls, ctx, extra: dict[str, Any]) -> dict[str, Any]:
     ctx.extra = dict(extra)
     result = runner.run(cls, ctx, timeout=20)
     iso = (result.details or {}).get("isolation") or {}
+    details = {
+        key: value
+        for key, value in (result.details or {}).items()
+        if key != "isolation"
+    }
+    launched = bool(iso.get("pid")) and not iso.get("spawn_error")
+    if details.get("reason") == REASON_SPAWN_FAILED:
+        launched = False
     return {
         "status": result.status,
-        "details": {
-            key: value
-            for key, value in (result.details or {}).items()
-            if key != "isolation"
-        },
-        "mechanism": iso.get("mechanism"),
+        "details": details,
+        "mechanism": iso.get("mechanism") or "none",
         "token_is_appcontainer": bool(iso.get("token_is_appcontainer")),
         "capabilities": iso.get("capabilities") or {},
         "reasons": ((iso.get("policy") or {}).get("reasons") or iso.get("reasons") or {}),
+        "pid": iso.get("pid"),
+        "spawn_error": iso.get("spawn_error"),
+        "worker_launched": launched,
     }
 
 
@@ -198,11 +229,15 @@ def _finalize(
     udp_bind_errors: dict[str, Any],
 ) -> dict[str, Any]:
     claimed = read.get("capabilities") or {}
-    report["mechanism"] = (
-        net.get("mechanism")
-        or listen_comm.get("mechanism")
-        or read.get("mechanism")
-        or "none"
+    report["mechanism"] = normalize_mechanism(
+        next(
+            (
+                probe.get("mechanism")
+                for probe in (net, listen_comm, read, write, spawn)
+                if probe.get("mechanism") and probe.get("mechanism") != "none"
+            ),
+            "none",
+        )
     )
     report["capabilities"].update(claimed)
     report["reasons"].update(read.get("reasons") or {})
@@ -352,16 +387,26 @@ def _finalize(
         }
     )
     report["observed"]["probe_completeness"] = build_probe_completeness(report["observed"])
-
-    report["capabilities"]["filesystem_restriction"] = _observed_state(
-        claimed.get("filesystem_restriction", "unsupported"),
-        denied=not read_ok and not write_ok,
-        succeeded=read_ok or write_ok,
-        reason_denied="Host sentinel read and write were denied",
-        reason_failed="Child read or wrote a host sentinel while filesystem_restriction was claimed",
-        report=report,
-        key="filesystem_restriction",
+    report["observed"]["read_worker_launched"] = probe_worker_launched(read)
+    report["observed"]["write_worker_launched"] = probe_worker_launched(write)
+    report["observed"]["network_worker_launched"] = probe_worker_launched(net)
+    report["observed"]["spawn_worker_launched"] = probe_worker_launched(spawn)
+    report["observed"]["listen_worker_launched"] = probe_worker_launched(listen_comm)
+    any_launched = any(
+        probe_worker_launched(probe) for probe in (read, write, net, spawn, listen_comm)
     )
+    report["observed"]["any_probe_worker_launched"] = any_launched
+
+    fs_state, fs_reason = evaluate_filesystem_restriction(
+        claimed=str(claimed.get("filesystem_restriction") or "unsupported"),
+        mechanism=report["mechanism"],
+        token_is_appcontainer=bool(read.get("token_is_appcontainer")),
+        read_probe=read,
+        write_probe=write,
+        host_write_exists=host_write_exists,
+    )
+    report["capabilities"]["filesystem_restriction"] = fs_state
+    report["reasons"]["filesystem_restriction"] = fs_reason
 
     # Evaluate from the network workers' claim/mechanism, not the read sentinel alone.
     claimed_net = str(mech.get("network_claim_for_evaluation") or "unsupported")
@@ -369,48 +414,25 @@ def _finalize(
     report["capabilities"]["network_restriction"] = net_state
     report["reasons"]["network_restriction"] = net_reason
 
-    report["capabilities"]["process_creation"] = _observed_state(
-        claimed.get("process_creation", "unsupported"),
-        denied=not spawned,
-        succeeded=spawned,
-        reason_denied="CreateProcess/Popen failed in the child",
-        reason_failed="Child spawned a process while process_creation was claimed enforced",
-        report=report,
-        key="process_creation",
-        allow_degraded_success=True,
+    spawn_caps = spawn.get("capabilities") or claimed
+    proc_state, proc_reason = evaluate_process_creation(
+        claimed=str(spawn_caps.get("process_creation") or claimed.get("process_creation") or "unsupported"),
+        mechanism=report["mechanism"],
+        spawn_probe=spawn,
+    )
+    report["capabilities"]["process_creation"] = proc_state
+    report["reasons"]["process_creation"] = proc_reason
+
+    boundary_state, boundary_reason = evaluate_process_boundary(any_worker_launched=any_launched)
+    report["capabilities"]["process_boundary"] = boundary_state
+    report["reasons"]["process_boundary"] = boundary_reason
+
+    reject_os_enforcement_without_mechanism(
+        report["capabilities"],
+        report["mechanism"],
+        reasons=report["reasons"],
     )
     return report
-
-
-def _observed_state(
-    claimed: str,
-    *,
-    denied: bool,
-    succeeded: bool,
-    reason_denied: str,
-    reason_failed: str,
-    report: dict[str, Any],
-    key: str,
-    allow_degraded_success: bool = False,
-) -> str:
-    if claimed == "enforced" and succeeded:
-        report["reasons"][key] = reason_failed
-        return "failed"
-    if denied:
-        report["reasons"][key] = reason_denied
-        if claimed in {"enforced", "degraded"}:
-            return claimed
-        return "enforced" if key != "process_creation" else (claimed if claimed != "unsupported" else "degraded")
-    if succeeded:
-        if claimed == "enforced":
-            report["reasons"][key] = reason_failed
-            return "failed"
-        if claimed == "degraded" and allow_degraded_success:
-            report["reasons"][key] = "Operation succeeded; restriction is only partial"
-            return "degraded"
-        report["reasons"][key] = "Forbidden operation succeeded"
-        return "unsupported" if claimed == "unsupported" else "failed"
-    return claimed
 
 
 def format_status(data: dict[str, Any]) -> str:

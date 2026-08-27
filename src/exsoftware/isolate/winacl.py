@@ -8,6 +8,8 @@ import sys
 from ctypes import wintypes
 from pathlib import Path
 
+from .acl_prep import acl_grant_succeeded, run_acl_command
+
 if sys.platform != "win32":  # pragma: no cover
     raise ImportError("winacl is Windows-only")
 
@@ -68,12 +70,14 @@ def current_user_sid() -> str:
 
 
 def _icacls(args: list[str]) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
+    return run_acl_command(
         ["icacls", *args],
-        capture_output=True,
-        timeout=60,
-        creationflags=CREATE_NO_WINDOW,
-        check=False,
+        runner=subprocess.run,
+        extra_kwargs={
+            "capture_output": True,
+            "creationflags": CREATE_NO_WINDOW,
+            "check": False,
+        },
     )
 
 
@@ -87,9 +91,13 @@ def restrict_directory_to_current_user(path: Path) -> None:
 
 
 def grant_sid(path: Path, sid: str, rights: str, *, recursive: bool = False) -> bool:
-    """Grant an inheritable ACE. *rights* is an icacls mask such as ``(OI)(CI)(RX)``."""
+    """Grant an inheritable ACE. *rights* is an icacls mask such as ``(OI)(CI)(RX)``.
+
+    Returns True only when icacls exits 0. Timeouts raise ``AclTimeoutError``
+    (an ``OSError``) and must never be treated as success.
+    """
     args = [str(path), "/grant", f"*{sid}:{rights}", "/C", "/Q"]
     if recursive:
         args.append("/T")
     completed = _icacls(args)
-    return completed.returncode == 0
+    return acl_grant_succeeded(returncode=completed.returncode, timed_out=False)
