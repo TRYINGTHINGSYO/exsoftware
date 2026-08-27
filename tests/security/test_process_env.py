@@ -19,8 +19,8 @@ def test_host_site_package_dirs_are_real_directories():
     assert dirs, "expected at least one host site-packages directory"
     for path in dirs:
         assert path.is_dir()
-        assert "site-packages" in path.name or "dist-packages" in path.name
-
+        # Prefix roots (e.g. hostedtoolcache .../x64) must be normalized away.
+        assert path.name.lower() in {"site-packages", "dist-packages"}
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix site-packages layout regression")
 def test_unix_pythonpath_includes_real_site_packages():

@@ -42,7 +42,9 @@ def host_site_package_dirs() -> list[Path]:
 
     Windows uses ``Lib/site-packages``; Unix uses ``lib/pythonX.Y/site-packages``
     (and Debian ``dist-packages``). Editable/user installs may also live under
-    the user site. Only directories that currently exist are returned.
+    the user site. ``site.getsitepackages()`` sometimes returns the interpreter
+    prefix itself (notably on Windows CI images); those are normalized to the
+    real site-packages directory when present.
     """
     import site
 
@@ -57,6 +59,7 @@ def host_site_package_dirs() -> list[Path]:
                 prefix / "lib" / ver / "dist-packages",
                 prefix / "local" / "lib" / ver / "dist-packages",
                 prefix / "local" / "lib" / ver / "site-packages",
+                prefix,
             ]
         )
     try:
@@ -74,10 +77,11 @@ def host_site_package_dirs() -> list[Path]:
     found: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
+        normalized = _normalize_site_packages_dir(candidate, ver)
+        if normalized is None:
+            continue
         try:
-            if not candidate.is_dir():
-                continue
-            resolved = str(candidate.resolve())
+            resolved = str(normalized.resolve())
         except OSError:
             continue
         if resolved in seen:
@@ -85,6 +89,31 @@ def host_site_package_dirs() -> list[Path]:
         seen.add(resolved)
         found.append(Path(resolved))
     return found
+
+
+def _normalize_site_packages_dir(path: Path, ver: str) -> Path | None:
+    """Return a concrete site-/dist-packages directory, or None."""
+    try:
+        if not path.exists():
+            return None
+    except OSError:
+        return None
+    name = path.name.lower()
+    if name in {"site-packages", "dist-packages"}:
+        return path if path.is_dir() else None
+    for child in (
+        path / "Lib" / "site-packages",
+        path / "lib" / ver / "site-packages",
+        path / "lib" / ver / "dist-packages",
+        path / "lib" / "site-packages",
+        path / "lib" / "dist-packages",
+    ):
+        try:
+            if child.is_dir():
+                return child
+        except OSError:
+            continue
+    return None
 
 
 def pythonpath_for_child() -> str:
