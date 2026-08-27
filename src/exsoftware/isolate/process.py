@@ -37,6 +37,56 @@ def worker_executable() -> str:
     return str(Path(sys.executable).resolve())
 
 
+def host_site_package_dirs() -> list[Path]:
+    """Existing host site-packages directories the isolated child must import from.
+
+    Windows uses ``Lib/site-packages``; Unix uses ``lib/pythonX.Y/site-packages``
+    (and Debian ``dist-packages``). Editable/user installs may also live under
+    the user site. Only directories that currently exist are returned.
+    """
+    import site
+
+    ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    candidates: list[Path] = []
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
+        candidates.extend(
+            [
+                prefix / "Lib" / "site-packages",
+                prefix / "lib" / ver / "site-packages",
+                prefix / "lib" / "site-packages",
+                prefix / "lib" / ver / "dist-packages",
+                prefix / "local" / "lib" / ver / "dist-packages",
+                prefix / "local" / "lib" / ver / "site-packages",
+            ]
+        )
+    try:
+        for item in site.getsitepackages():
+            candidates.append(Path(item))
+    except (AttributeError, OSError):
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if user_site:
+            candidates.append(Path(user_site))
+    except (AttributeError, OSError):
+        pass
+
+    found: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir():
+                continue
+            resolved = str(candidate.resolve())
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(Path(resolved))
+    return found
+
+
 def pythonpath_for_child() -> str:
     parts: list[str]
     if sys.platform == "win32":
@@ -52,9 +102,11 @@ def pythonpath_for_child() -> str:
                 parts.append(str(site))
     else:
         src = str(Path(__file__).resolve().parents[2])
-        venv_site = str(Path(sys.prefix) / "Lib" / "site-packages")
-        base_site = str(Path(sys.base_prefix) / "Lib" / "site-packages")
-        parts = [src, venv_site, base_site]
+        parts = [src]
+        for site_dir in host_site_package_dirs():
+            text = str(site_dir)
+            if text not in parts:
+                parts.append(text)
     current = os.environ.get("PYTHONPATH", "")
     for item in current.split(os.pathsep):
         if item and item not in parts:
@@ -229,7 +281,13 @@ def _spawn_windows_fallback(command, workdir, env, stdout, stderr, job):
 def _spawn_unix(command, workdir, env, policy, stdout, stderr):
     from .unixcontain import apply_unix_policy, describe_unix_support, unix_preexec
 
-    allow = [Path(sys.prefix), Path(sys.base_prefix), Path(sys.executable).resolve().parent, Path(__file__).resolve().parents[2]]
+    allow = [
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.executable).resolve().parent,
+        Path(__file__).resolve().parents[2],
+        *host_site_package_dirs(),
+    ]
     support = describe_unix_support()
     preexec = unix_preexec(policy, workdir, allow)
     proc = subprocess.Popen(

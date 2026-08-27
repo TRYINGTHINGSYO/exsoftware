@@ -108,12 +108,14 @@ def test_network_sockets_match_claimed_capability():
         assert connect_ok is False
         assert external_ok is False
     elif net == "degraded":
-        # Partial restriction is allowed only if we do not claim full denial.
-        return
+        pytest.skip(
+            "network_restriction=degraded; not claiming full denial "
+            f"(connect_ok={connect_ok}, external_ok={external_ok})"
+        )
     elif net == "unsupported":
         if sys.platform == "win32" and (_caps(result).get("filesystem_restriction") == "enforced"):
             pytest.fail("AppContainer filesystem enforced but network marked unsupported")
-        return
+        pytest.skip(f"network_restriction unsupported on {sys.platform}")
     else:
         pytest.fail(f"unexpected network_restriction={net}")
     # Always record bind outcome for diagnostics; do not assert a specific value.
@@ -130,7 +132,10 @@ def test_spawn_matches_claimed_capability():
         assert result.details.get("denied") is True
     elif state == "degraded":
         # Creation may succeed; Stage 3 still kills the tree on timeout.
-        return
+        pytest.skip(
+            "process_creation=degraded; not claiming full CreateProcess denial "
+            f"(spawned={spawned})"
+        )
     else:
         pytest.skip(f"process_creation {state}")
 

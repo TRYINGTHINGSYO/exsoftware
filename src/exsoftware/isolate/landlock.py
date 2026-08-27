@@ -81,7 +81,8 @@ def apply_landlock(workdir: Path, allow_paths: list[Path]) -> None:
         for path in allow_paths:
             if path.exists():
                 _add_path(libc, ruleset, path, READ_EXEC)
-        for standard in (Path("/usr"), Path("/lib"), Path("/lib64"), Path("/etc")):
+        # Interpreter/runtime paths. /dev is required for DEVNULL and similar.
+        for standard in (Path("/usr"), Path("/lib"), Path("/lib64"), Path("/etc"), Path("/dev")):
             if standard.exists():
                 _add_path(libc, ruleset, standard, READ_EXEC)
         if libc.syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset, 0) != 0:
