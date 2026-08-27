@@ -6,17 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from exsoftware.isolate.acl_prep import AclTimeoutError
+from exsoftware.isolate.acl_prep import PROCESS_ACL_CACHE, AclTimeoutError
 from exsoftware.isolate.winruntime import (
     RUNTIME_LAYOUT_VERSION,
     SKIP_DIR_NAMES,
+    _runtime_complete,
     acl_sid_marker_name,
+    application_package_fingerprint,
     child_path_entries,
     copy_runtime,
     extra_host_site_packages,
     looks_like_conda_prefix,
     runtime_copy_plan,
     stage_cpython_tree,
+    staged_python_root,
 )
 
 
@@ -220,3 +223,108 @@ def test_child_path_includes_conda_library_bin(tmp_path: Path):
     entries = child_path_entries(python_exe)
     assert str(tmp_path.resolve()) in entries
     assert str(library_bin.resolve()) in entries
+
+
+def test_application_source_change_invalidates_staged_runtime(tmp_path: Path, monkeypatch):
+    """Staged exsoftware must not be reused after source changes without a version bump."""
+    src_root = tmp_path / "src"
+    pkg = src_root / "exsoftware"
+    _write(pkg / "__init__.py", "version-one")
+    _write(pkg / "worker.py", "payload=1\n")
+    _write(pkg / "__pycache__" / "worker.cpython-312.pyc", "bytecode")
+    monkeypatch.setattr("exsoftware.isolate.winruntime.python_src_root", lambda: src_root)
+
+    source = _fake_cpython(tmp_path / "Python314")
+    monkeypatch.setattr("exsoftware.isolate.winruntime.python_install_root", lambda: source)
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.version", "3.14.0-fingerprint-test")
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+
+    fp_before = application_package_fingerprint()
+    dest_before = staged_python_root()
+    stage_cpython_tree(source, dest_before, appcontainer_sid=None)
+    staged_init = dest_before / "Lib" / "site-packages" / "exsoftware" / "__init__.py"
+    assert staged_init.read_text(encoding="utf-8") == "version-one"
+    assert not (dest_before / "Lib" / "site-packages" / "exsoftware" / "__pycache__").exists()
+    marker = dest_before / ".exsoftware-runtime-complete"
+    assert _runtime_complete(marker, source, app_fingerprint=fp_before)
+    assert f"app={fp_before}" in marker.read_text(encoding="utf-8")
+
+    # Same Python/version/install root; only application source changes.
+    _write(pkg / "__init__.py", "version-two")
+    fp_after = application_package_fingerprint()
+    assert fp_after != fp_before
+    dest_after = staged_python_root()
+    assert dest_after != dest_before
+    assert not _runtime_complete(marker, source, app_fingerprint=fp_after)
+
+    stage_cpython_tree(source, dest_after, appcontainer_sid=None)
+    assert (dest_after / "Lib" / "site-packages" / "exsoftware" / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "version-two"
+    # Old staged tree still has stale code but must not be the selected identity.
+    assert staged_init.read_text(encoding="utf-8") == "version-one"
+
+
+def test_unchanged_application_source_reuses_staged_runtime(tmp_path: Path, monkeypatch):
+    src_root = tmp_path / "src"
+    pkg = src_root / "exsoftware"
+    _write(pkg / "__init__.py", "stable")
+    monkeypatch.setattr("exsoftware.isolate.winruntime.python_src_root", lambda: src_root)
+
+    source = _fake_cpython(tmp_path / "Python314")
+    monkeypatch.setattr("exsoftware.isolate.winruntime.python_install_root", lambda: source)
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.version", "3.14.0-reuse-test")
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+
+    dest = staged_python_root()
+    first = stage_cpython_tree(source, dest, appcontainer_sid=None)
+    marker_mtime = (dest / ".exsoftware-runtime-complete").stat().st_mtime_ns
+    second = stage_cpython_tree(source, dest, appcontainer_sid=None)
+    assert first == second == dest
+    assert staged_python_root() == dest
+    assert (dest / ".exsoftware-runtime-complete").stat().st_mtime_ns == marker_mtime
+
+
+def test_application_fingerprint_ignores_pycache_noise(tmp_path: Path):
+    pkg = tmp_path / "exsoftware"
+    _write(pkg / "__init__.py", "same")
+    fp1 = application_package_fingerprint(pkg)
+    _write(pkg / "__pycache__" / "x.pyc", "noise")
+    _write(pkg / "module.pyc", "also-noise")
+    fp2 = application_package_fingerprint(pkg)
+    assert fp1 == fp2
+
+
+def test_copy_error_does_not_poison_process_acl_cache(tmp_path: Path, monkeypatch):
+    source = _fake_cpython(tmp_path / "Python314")
+    dest = tmp_path / "runtime"
+    grants = {"n": 0}
+
+    def grant(*_args, **_kwargs):
+        grants["n"] += 1
+        return True
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full while copying runtime files")
+
+    monkeypatch.setattr("exsoftware.isolate.winruntime.copy_runtime", boom)
+    with pytest.raises(OSError, match="disk full"):
+        stage_cpython_tree(source, dest, appcontainer_sid="S-1-5-64-96", grant_sid_fn=grant)
+    assert PROCESS_ACL_CACHE.failed is False
+    assert grants["n"] == 1
+
+    # A later attempt must still be allowed to run (ACL cache was not poisoned).
+    monkeypatch.undo()
+    source2 = _fake_cpython(tmp_path / "Python315")
+    dest2 = tmp_path / "runtime2"
+    grants2 = {"n": 0}
+
+    def grant2(*_args, **_kwargs):
+        grants2["n"] += 1
+        return True
+
+    PROCESS_ACL_CACHE.raise_if_failed()
+    result = stage_cpython_tree(source2, dest2, appcontainer_sid="S-1-5-64-96", grant_sid_fn=grant2)
+    assert result == dest2
+    assert grants2["n"] == 1
+    assert (dest2 / "python.exe").is_file()

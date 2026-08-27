@@ -32,7 +32,8 @@ from .acl_prep import PROCESS_ACL_CACHE
 _LOCK = threading.Lock()
 
 # Bump when the staged layout changes so fat historical copies are rebuilt.
-RUNTIME_LAYOUT_VERSION = "4"
+# Layout 5: identity includes a fingerprint of staged exsoftware package contents.
+RUNTIME_LAYOUT_VERSION = "5"
 
 # Directory names never copied from any Python install root (any depth).
 SKIP_DIR_NAMES = frozenset(
@@ -98,10 +99,69 @@ def python_src_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def application_package_root() -> Path:
+    return python_src_root() / "exsoftware"
+
+
+def _package_entry_ignored(name: str) -> bool:
+    """Match copy_runtime ignore rules for fingerprinting staged application files."""
+    lowered = name.lower()
+    return lowered in SKIP_DIR_NAMES or lowered.endswith((".pyc", ".pdb"))
+
+
+def iter_application_package_files(package_root: Path | None = None) -> list[Path]:
+    """Runtime-relevant files under the exsoftware package, stable relative order."""
+    root = Path(package_root) if package_root is not None else application_package_root()
+    if not root.is_dir():
+        return []
+    files: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if not _package_entry_ignored(name))
+        for name in sorted(filenames):
+            if _package_entry_ignored(name):
+                continue
+            files.append(Path(dirpath) / name)
+    files.sort(key=lambda path: path.relative_to(root).as_posix())
+    return files
+
+
+def application_package_fingerprint(package_root: Path | None = None) -> str:
+    """Deterministic fingerprint of staged application sources (paths + contents).
+
+    Editable/development checkouts can change without a package version bump, so
+    the staged runtime identity must hash the files that ``_copy_application_package``
+    would install — not ``exsoftware.__version__`` alone.
+    """
+    root = Path(package_root) if package_root is not None else application_package_root()
+    digest = hashlib.sha256()
+    if not root.is_dir():
+        digest.update(b"missing\0")
+        return digest.hexdigest()
+    for path in iter_application_package_files(root):
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError as exc:
+            digest.update(f"unreadable:{exc}".encode("utf-8", errors="replace"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def staged_python_root() -> Path:
     base = python_install_root()
-    key = hashlib.sha256(f"{sys.version}|{base}|layout={RUNTIME_LAYOUT_VERSION}".encode("utf-8")).hexdigest()[:16]
-    return Path(os.environ.get("TEMP") or os.environ.get("TMP") or os.getenv("LOCALAPPDATA") or ".") / "exsoftware-isolate" / "runtime" / key
+    app = application_package_fingerprint()
+    key_material = (
+        f"{sys.version}|{base}|layout={RUNTIME_LAYOUT_VERSION}|app={app}"
+    )
+    key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:16]
+    return (
+        Path(os.environ.get("TEMP") or os.environ.get("TMP") or os.getenv("LOCALAPPDATA") or ".")
+        / "exsoftware-isolate"
+        / "runtime"
+        / key
+    )
 
 
 def staged_python_executable() -> Path:
@@ -276,19 +336,43 @@ def _copy_application_package(dest_runtime: Path) -> None:
     shutil.copytree(src_pkg, dest_pkg, ignore=_ignore_skipped, copy_function=shutil.copy2)
 
 
-def _runtime_complete(marker: Path, source: Path) -> bool:
+def _runtime_complete(
+    marker: Path,
+    source: Path,
+    *,
+    app_fingerprint: str | None = None,
+) -> bool:
     if not marker.is_file():
         return False
     try:
         text = marker.read_text(encoding="utf-8")
     except OSError:
         return False
-    return str(source) in text and f"layout={RUNTIME_LAYOUT_VERSION}" in text
+    fingerprint = (
+        app_fingerprint
+        if app_fingerprint is not None
+        else application_package_fingerprint()
+    )
+    return (
+        str(source) in text
+        and f"layout={RUNTIME_LAYOUT_VERSION}" in text
+        and f"app={fingerprint}" in text
+    )
 
 
-def _write_runtime_marker(dest: Path, source: Path) -> None:
+def _write_runtime_marker(
+    dest: Path,
+    source: Path,
+    *,
+    app_fingerprint: str | None = None,
+) -> None:
+    fingerprint = (
+        app_fingerprint
+        if app_fingerprint is not None
+        else application_package_fingerprint()
+    )
     (dest / ".exsoftware-runtime-complete").write_text(
-        f"{source}\nlayout={RUNTIME_LAYOUT_VERSION}\n",
+        f"{source}\nlayout={RUNTIME_LAYOUT_VERSION}\napp={fingerprint}\n",
         encoding="utf-8",
     )
 
@@ -308,9 +392,14 @@ def stage_cpython_tree(
     """
     source = Path(source)
     dest = Path(dest)
+    app_fingerprint = application_package_fingerprint()
     marker = dest / ".exsoftware-runtime-complete"
     acl_marker = dest / acl_sid_marker_name(appcontainer_sid) if appcontainer_sid else None
-    if marker.is_file() and (dest / "python.exe").is_file() and _runtime_complete(marker, source):
+    if (
+        marker.is_file()
+        and (dest / "python.exe").is_file()
+        and _runtime_complete(marker, source, app_fingerprint=app_fingerprint)
+    ):
         if appcontainer_sid is None or (acl_marker is not None and acl_marker.is_file()):
             return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -328,20 +417,25 @@ def stage_cpython_tree(
                 grant = grant_sid
             if grant is None:
                 raise OSError("AppContainer SID provided but no ACL grant function is available")
-            ok = bool(grant(staging, appcontainer_sid, "(OI)(CI)(RX)", recursive=False))
+            try:
+                ok = bool(grant(staging, appcontainer_sid, "(OI)(CI)(RX)", recursive=False))
+            except OSError as exc:
+                # Only ACL bootstrap failures poison the process-wide cache.
+                PROCESS_ACL_CACHE.record_failure(exc)
+                raise
             if not ok:
-                raise OSError("failed to apply inheritable AppContainer ACE before runtime copy")
+                exc = OSError("failed to apply inheritable AppContainer ACE before runtime copy")
+                PROCESS_ACL_CACHE.record_failure(exc)
+                raise exc
         copy_runtime(source, staging)
-        _write_runtime_marker(staging, source)
+        _write_runtime_marker(staging, source, app_fingerprint=app_fingerprint)
         if appcontainer_sid:
             (staging / acl_sid_marker_name(appcontainer_sid)).write_text("ok", encoding="utf-8")
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         os.replace(staging, dest)
-    except BaseException as exc:
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
-        if isinstance(exc, OSError):
-            PROCESS_ACL_CACHE.record_failure(exc)
         raise
     return dest
 
@@ -350,6 +444,7 @@ def ensure_staged_cpython(*, appcontainer_sid: str | None = None) -> Path:
     """Return a user-owned copy of the base interpreter directory."""
     dest = staged_python_root()
     source = python_install_root()
+    app_fingerprint = application_package_fingerprint()
     sid = appcontainer_sid
     if sid is None and sys.platform == "win32":
         try:
@@ -360,11 +455,19 @@ def ensure_staged_cpython(*, appcontainer_sid: str | None = None) -> Path:
             sid = None
     marker = dest / ".exsoftware-runtime-complete"
     acl_marker = dest / acl_sid_marker_name(sid) if sid else None
-    if marker.is_file() and (dest / "python.exe").is_file() and _runtime_complete(marker, source):
+    if (
+        marker.is_file()
+        and (dest / "python.exe").is_file()
+        and _runtime_complete(marker, source, app_fingerprint=app_fingerprint)
+    ):
         if sid is None or (acl_marker is not None and acl_marker.is_file()):
             return dest
     with _LOCK:
-        if marker.is_file() and (dest / "python.exe").is_file() and _runtime_complete(marker, source):
+        if (
+            marker.is_file()
+            and (dest / "python.exe").is_file()
+            and _runtime_complete(marker, source, app_fingerprint=app_fingerprint)
+        ):
             if sid is None or (acl_marker is not None and acl_marker.is_file()):
                 return dest
         return stage_cpython_tree(source, dest, appcontainer_sid=sid)
