@@ -43,6 +43,61 @@ def filesystem_mechanism_supports_enforced(
     return False
 
 
+def assess_filesystem_mechanisms(
+    read_probe: dict[str, Any],
+    write_probe: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare filesystem probe mechanisms. Aggregate report mechanism is not proof."""
+    read_mech = normalize_mechanism(read_probe.get("mechanism"))
+    write_mech = normalize_mechanism(write_probe.get("mechanism"))
+    read_token = bool(read_probe.get("token_is_appcontainer"))
+    write_token = bool(write_probe.get("token_is_appcontainer"))
+    result: dict[str, Any] = {
+        "read_mechanism": read_mech,
+        "write_mechanism": write_mech,
+        "read_token_is_appcontainer": read_token,
+        "write_token_is_appcontainer": write_token,
+        "filesystem_mechanism_consistent": False,
+        "filesystem_mechanism_supports_enforced": False,
+        "filesystem_claim_mechanism": "none",
+        "filesystem_mechanism_reason": "",
+    }
+    if read_mech != write_mech:
+        result["filesystem_mechanism_reason"] = (
+            f"filesystem probe mechanisms disagree ({read_mech!r} vs {write_mech!r})"
+        )
+        return result
+    result["filesystem_mechanism_consistent"] = True
+    result["filesystem_claim_mechanism"] = read_mech
+    if not mechanism_allows_os_enforcement(read_mech):
+        result["filesystem_mechanism_reason"] = (
+            "No OS containment mechanism; filesystem restriction cannot be enforced"
+        )
+        return result
+    # AppContainer enforcement requires confirmed tokens on both filesystem workers.
+    token_ok = read_token and write_token if read_mech == "appcontainer" else False
+    if filesystem_mechanism_supports_enforced(read_mech, token_is_appcontainer=token_ok):
+        result["filesystem_mechanism_supports_enforced"] = True
+        if read_mech == "appcontainer":
+            result["filesystem_mechanism_reason"] = (
+                "AppContainer confirmed on filesystem read and write probes"
+            )
+        else:
+            result["filesystem_mechanism_reason"] = (
+                f"filesystem probes agree on mechanism {read_mech!r}"
+            )
+        return result
+    if read_mech == "appcontainer":
+        result["filesystem_mechanism_reason"] = (
+            "AppContainer filesystem probes lack confirmed TokenIsAppContainer evidence"
+        )
+    else:
+        result["filesystem_mechanism_reason"] = (
+            f"mechanism {read_mech!r} does not support enforced filesystem restriction"
+        )
+    return result
+
+
 def probe_worker_launched(probe: dict[str, Any] | None) -> bool:
     """True when the isolated child actually started."""
     if not probe:
@@ -97,25 +152,40 @@ def operation_attempted(details: dict[str, Any] | None, ok_key: str) -> bool:
 def evaluate_filesystem_restriction(
     *,
     claimed: str,
-    mechanism: Any,
-    token_is_appcontainer: bool,
     read_probe: dict[str, Any],
     write_probe: dict[str, Any],
     host_write_exists: bool,
+    mechanism: Any = None,
+    token_is_appcontainer: bool = False,
 ) -> tuple[str, str]:
     """Return (state, reason) from live filesystem probes.
 
-    ``enforced`` requires a launched worker, a known containment mechanism, a
+    ``enforced`` requires launched workers under a consistent containment
+    mechanism (each probe's own, not an aggregate report mechanism), a
     completed helper with a validated response, and an actual denied attempt.
+
+    ``mechanism`` / ``token_is_appcontainer`` are ignored when probes carry
+    their own mechanism fields; they remain only for older call sites.
     """
     claimed = claimed or "unsupported"
-    mech = normalize_mechanism(mechanism)
     read_details = read_probe.get("details") or {}
     write_details = write_probe.get("details") or {}
     if not isinstance(read_details, dict):
         read_details = {}
     if not isinstance(write_details, dict):
         write_details = {}
+
+    # Prefer each probe's own mechanism; fall back only when probes omit it.
+    if "mechanism" not in read_probe and mechanism is not None:
+        read_probe = {**read_probe, "mechanism": mechanism}
+    if "mechanism" not in write_probe and mechanism is not None:
+        write_probe = {**write_probe, "mechanism": mechanism}
+    if "token_is_appcontainer" not in read_probe and token_is_appcontainer:
+        read_probe = {**read_probe, "token_is_appcontainer": token_is_appcontainer}
+    if "token_is_appcontainer" not in write_probe and token_is_appcontainer:
+        write_probe = {**write_probe, "token_is_appcontainer": token_is_appcontainer}
+
+    fs_mech = assess_filesystem_mechanisms(read_probe, write_probe)
 
     read_ok = bool(read_details.get("read_ok"))
     write_ok = bool(write_details.get("write_ok")) or bool(host_write_exists)
@@ -130,10 +200,16 @@ def evaluate_filesystem_restriction(
             "Forbidden filesystem operation succeeded",
         )
 
-    if not mechanism_allows_os_enforcement(mech):
+    if not fs_mech["filesystem_mechanism_consistent"]:
+        # Disagreeing probes (or one falling back to none) cannot yield enforced.
+        state = "degraded" if claimed == "enforced" else claimed
+        return state, fs_mech["filesystem_mechanism_reason"]
+
+    if not mechanism_allows_os_enforcement(fs_mech["filesystem_claim_mechanism"]):
         return (
             "unsupported",
-            "No OS containment mechanism; filesystem restriction cannot be enforced",
+            fs_mech["filesystem_mechanism_reason"]
+            or "No OS containment mechanism; filesystem restriction cannot be enforced",
         )
 
     read_complete, read_reason = probe_helper_complete(read_probe, result_keys=("read_ok", "denied"))
@@ -155,9 +231,7 @@ def evaluate_filesystem_restriction(
             state = "degraded" if claimed == "enforced" else claimed
             return state, "filesystem write operation was not attempted"
 
-    if claimed == "enforced" and not filesystem_mechanism_supports_enforced(
-        mech, token_is_appcontainer=token_is_appcontainer
-    ):
+    if claimed == "enforced" and not fs_mech["filesystem_mechanism_supports_enforced"]:
         claimed = "degraded"
 
     if claimed in {"enforced", "degraded"}:
@@ -168,10 +242,18 @@ def evaluate_filesystem_restriction(
 def evaluate_process_creation(
     *,
     claimed: str,
-    mechanism: Any,
     spawn_probe: dict[str, Any],
+    mechanism: Any = None,
 ) -> tuple[str, str]:
+    """Evaluate process_creation from the spawn probe's own mechanism.
+
+    An aggregate report mechanism from another worker must not be used as proof.
+    """
     claimed = claimed or "unsupported"
+    # Spawn probe mechanism is authoritative; optional mechanism= is legacy fallback.
+    mech = normalize_mechanism(
+        spawn_probe.get("mechanism") if spawn_probe.get("mechanism") is not None else mechanism
+    )
     details = spawn_probe.get("details") or {}
     if not isinstance(details, dict):
         details = {}
@@ -197,7 +279,7 @@ def evaluate_process_creation(
         state = "degraded" if claimed == "enforced" else claimed
         return state, "process creation operation was not attempted"
 
-    if not mechanism_allows_os_enforcement(mechanism):
+    if not mechanism_allows_os_enforcement(mech):
         return (
             "unsupported",
             "No OS containment mechanism; process creation cannot be enforced",

@@ -24,6 +24,7 @@ from .network_capability import (
 )
 from .policy import CAPABILITIES
 from .probe_evidence import (
+    assess_filesystem_mechanisms,
     evaluate_filesystem_restriction,
     evaluate_process_boundary,
     evaluate_process_creation,
@@ -397,10 +398,26 @@ def _finalize(
     )
     report["observed"]["any_probe_worker_launched"] = any_launched
 
+    # Per-probe mechanisms are proof; report["mechanism"] is display/summary only.
+    fs_mech = assess_filesystem_mechanisms(read, write)
+    report["observed"].update(
+        {
+            "read_mechanism": fs_mech.get("read_mechanism"),
+            "write_mechanism": fs_mech.get("write_mechanism"),
+            "spawn_mechanism": normalize_mechanism(spawn.get("mechanism")),
+            "read_token_is_appcontainer": bool(fs_mech.get("read_token_is_appcontainer")),
+            "write_token_is_appcontainer": bool(fs_mech.get("write_token_is_appcontainer")),
+            "filesystem_mechanism_consistent": bool(fs_mech.get("filesystem_mechanism_consistent")),
+            "filesystem_mechanism_supports_enforced": bool(
+                fs_mech.get("filesystem_mechanism_supports_enforced")
+            ),
+            "filesystem_mechanism_reason": fs_mech.get("filesystem_mechanism_reason"),
+            "filesystem_claim_mechanism": fs_mech.get("filesystem_claim_mechanism"),
+        }
+    )
+
     fs_state, fs_reason = evaluate_filesystem_restriction(
         claimed=str(claimed.get("filesystem_restriction") or "unsupported"),
-        mechanism=report["mechanism"],
-        token_is_appcontainer=bool(read.get("token_is_appcontainer")),
         read_probe=read,
         write_probe=write,
         host_write_exists=host_write_exists,
@@ -416,8 +433,11 @@ def _finalize(
 
     spawn_caps = spawn.get("capabilities") or claimed
     proc_state, proc_reason = evaluate_process_creation(
-        claimed=str(spawn_caps.get("process_creation") or claimed.get("process_creation") or "unsupported"),
-        mechanism=report["mechanism"],
+        claimed=str(
+            spawn_caps.get("process_creation")
+            or claimed.get("process_creation")
+            or "unsupported"
+        ),
         spawn_probe=spawn,
     )
     report["capabilities"]["process_creation"] = proc_state
@@ -427,6 +447,8 @@ def _finalize(
     report["capabilities"]["process_boundary"] = boundary_state
     report["reasons"]["process_boundary"] = boundary_reason
 
+    # Last-line safety when no probe reported a real mechanism. Do not use the
+    # aggregate summary as positive proof for a capability from another probe.
     reject_os_enforcement_without_mechanism(
         report["capabilities"],
         report["mechanism"],
