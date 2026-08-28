@@ -290,7 +290,6 @@ def prepare_appcontainer_paths(workdir: Path, sid: str) -> list[str]:
     from .winruntime import (
         acl_sid_marker_name,
         ensure_staged_cpython,
-        extra_host_site_packages,
     )
 
     PROCESS_ACL_CACHE.raise_if_failed()
@@ -300,7 +299,7 @@ def prepare_appcontainer_paths(workdir: Path, sid: str) -> list[str]:
             raise OSError(f"failed to grant AppContainer ACE on workspace {workdir}")
         granted.append(str(workdir))
         staged = ensure_staged_cpython(appcontainer_sid=sid)
-        prefixes: list[Path] = [staged, *extra_host_site_packages()]
+        prefixes: list[Path] = [staged]
         cache_root = Path(tempfile.gettempdir()) / "exsoftware-isolate" / "acl-cache"
         cache_root.mkdir(parents=True, exist_ok=True)
         sid_key = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:16]

@@ -8,6 +8,7 @@ import pytest
 
 from exsoftware.isolate.acl_prep import PROCESS_ACL_CACHE, AclTimeoutError
 from exsoftware.isolate.winruntime import (
+    REQUIRED_RUNTIME_SITE_ENTRIES,
     RUNTIME_LAYOUT_VERSION,
     SKIP_DIR_NAMES,
     _runtime_complete,
@@ -18,6 +19,7 @@ from exsoftware.isolate.winruntime import (
     extra_host_site_packages,
     looks_like_conda_prefix,
     runtime_copy_plan,
+    runtime_site_package_sources,
     stage_cpython_tree,
     staged_python_root,
 )
@@ -54,6 +56,12 @@ def _fake_conda(root: Path) -> Path:
     _write(root / "Library" / "include" / "sqlite3.h")
     _write(root / "condabin" / "conda.bat")
     _write(root / "share" / "doc" / "readme.txt")
+    _write(root / "Lib" / "site-packages" / "huge_unrelated_package" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "fastapi" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "uvicorn" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "cryptography" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "cryptography-99.dist-info" / "METADATA")
+    _write(root / "Lib" / "site-packages" / "cryptography.libs" / "crypto.dll")
     return root
 
 
@@ -82,6 +90,9 @@ def test_staged_runtime_excludes_unrelated_conda_directories(tmp_path: Path):
     assert (dest / "python.exe").is_file()
     assert (dest / "Lib" / "os.py").is_file()
     assert (dest / "Lib" / "site-packages" / "pefile.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "cryptography" / "__init__.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "cryptography-99.dist-info" / "METADATA").is_file()
+    assert (dest / "Lib" / "site-packages" / "cryptography.libs" / "crypto.dll").is_file()
     assert (dest / "Lib" / "site-packages" / "exsoftware" / "__init__.py").is_file()
     assert (dest / "zlib.dll").is_file()
     assert (dest / "Library" / "bin" / "sqlite3.dll").is_file()
@@ -94,8 +105,12 @@ def test_staged_runtime_excludes_unrelated_conda_directories(tmp_path: Path):
     assert not (dest / "Library" / "include").exists()
     assert not (dest / "Lib" / "test").exists()
     assert not (dest / "Lib" / "idlelib").exists()
+    assert not (dest / "Lib" / "site-packages" / "huge_unrelated_package").exists()
+    assert not (dest / "Lib" / "site-packages" / "fastapi").exists()
+    assert not (dest / "Lib" / "site-packages" / "uvicorn").exists()
     for skipped in ("pkgs", "conda-meta", "envs", "docs", "tests"):
         assert skipped in SKIP_DIR_NAMES
+    assert "pefile.py" in REQUIRED_RUNTIME_SITE_ENTRIES
 
 
 def test_python_org_layout_copies_interpreter_and_stdlib(tmp_path: Path):
@@ -181,6 +196,34 @@ def test_venv_site_packages_are_extra_acl_targets(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("exsoftware.isolate.winruntime.sys.base_prefix", str(base))
     extra = extra_host_site_packages(install_root=base)
     assert site.resolve() in extra
+
+
+def test_runtime_site_package_sources_prioritize_venv(tmp_path: Path, monkeypatch):
+    base = _fake_conda(tmp_path / "miniconda3")
+    venv = tmp_path / "venv"
+    venv_site = venv / "Lib" / "site-packages"
+    venv_site.mkdir(parents=True)
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.prefix", str(venv))
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.base_prefix", str(base))
+    sources = runtime_site_package_sources(base)
+    assert sources[0].resolve() == venv_site.resolve()
+    assert sources[1].resolve() == (base / "Lib" / "site-packages").resolve()
+
+
+def test_venv_runtime_copies_required_packages_without_base_shadowing(tmp_path: Path, monkeypatch):
+    base = _fake_conda(tmp_path / "miniconda3")
+    _write(base / "Lib" / "site-packages" / "pefile.py", "base-pefile")
+    venv = tmp_path / "venv"
+    _write(venv / "Lib" / "site-packages" / "pefile.py", "venv-pefile")
+    _write(venv / "Lib" / "site-packages" / "unrelated_big_pkg" / "__init__.py")
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.prefix", str(venv))
+    monkeypatch.setattr("exsoftware.isolate.winruntime.sys.base_prefix", str(base))
+
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(base, dest)
+    assert (dest / "Lib" / "site-packages" / "pefile.py").read_text(encoding="utf-8") == "venv-pefile"
+    assert not (dest / "Lib" / "site-packages" / "unrelated_big_pkg").exists()
 
 
 def test_stage_acl_failure_is_reused_without_retry(tmp_path: Path):

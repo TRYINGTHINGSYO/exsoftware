@@ -119,16 +119,13 @@ def _normalize_site_packages_dir(path: Path, ver: str) -> Path | None:
 def pythonpath_for_child() -> str:
     parts: list[str]
     if sys.platform == "win32":
-        from .winruntime import extra_host_site_packages, staged_python_root
+        from .winruntime import staged_python_root
 
         # Staged Lib/site-packages contains a copy of exsoftware plus interpreter
         # site-packages. Prefer it over the live src tree so AppContainer does not
         # need an ACE on the developer checkout (often a subst drive).
         staged_site = staged_python_root() / "Lib" / "site-packages"
         parts = [str(staged_site)]
-        for site in extra_host_site_packages():
-            if str(site) not in parts:
-                parts.append(str(site))
     else:
         src = str(Path(__file__).resolve().parents[2])
         parts = [src]
@@ -136,10 +133,10 @@ def pythonpath_for_child() -> str:
             text = str(site_dir)
             if text not in parts:
                 parts.append(text)
-    current = os.environ.get("PYTHONPATH", "")
-    for item in current.split(os.pathsep):
-        if item and item not in parts:
-            parts.append(item)
+        current = os.environ.get("PYTHONPATH", "")
+        for item in current.split(os.pathsep):
+            if item and item not in parts:
+                parts.append(item)
     return os.pathsep.join(parts)
 
 
@@ -161,23 +158,13 @@ def child_env(*, test_mode: bool, workdir: Path) -> dict[str, str]:
         system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or r"C:\Windows"
         python_exe = Path(worker_executable()).resolve()
         python_dir = str(python_exe.parent)
-        from .winruntime import child_path_entries
-
-        path_entries = child_path_entries(python_exe)
         env.update(
             {
                 "SystemRoot": system_root,
                 "SYSTEMROOT": system_root,
                 "WINDIR": os.environ.get("WINDIR") or system_root,
                 "PYTHONHOME": python_dir,
-                "PATH": os.pathsep.join(
-                    [
-                        *path_entries,
-                        str(Path(sys.prefix) / "Scripts"),
-                        str(Path(system_root) / "System32"),
-                        str(Path(system_root) / "System32" / "Wbem"),
-                    ]
-                ),
+                "PATH": os.pathsep.join(windows_child_path_entries(python_exe, system_root)),
                 "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
                 "PROCESSOR_ARCHITECTURE": os.environ.get("PROCESSOR_ARCHITECTURE", "AMD64"),
                 "NUMBER_OF_PROCESSORS": os.environ.get("NUMBER_OF_PROCESSORS", "1"),
@@ -196,6 +183,16 @@ def child_env(*, test_mode: bool, workdir: Path) -> dict[str, str]:
     if test_mode:
         env["EXSOFTWARE_ISOLATE_TEST"] = "1"
     return env
+
+
+def windows_child_path_entries(python_exe: Path, system_root: str) -> list[str]:
+    from .winruntime import child_path_entries
+
+    return [
+        *child_path_entries(python_exe),
+        str(Path(system_root) / "System32"),
+        str(Path(system_root) / "System32" / "Wbem"),
+    ]
 
 
 def spawn_worker(

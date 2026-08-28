@@ -77,6 +77,33 @@ CONDA_MARKER_DIRS = frozenset({"conda-meta", "conda-bld", "condabin", "pkgs"})
 
 _ROOT_NAME_EXACT = frozenset({"python.exe", "pythonw.exe"})
 
+# Third-party packages that isolated workers may import while analyzing files.
+# Server-only dependencies (FastAPI/Uvicorn/python-multipart) are intentionally
+# omitted: AppContainer workers run analyzer modules, not the HTTP server.
+REQUIRED_RUNTIME_SITE_ENTRIES = (
+    "pefile.py",
+    "elftools",
+    "olefile.py",
+    "pypdf",
+    "PIL",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "_cffi_backend",
+    "typing_extensions.py",
+)
+REQUIRED_RUNTIME_DIST_PREFIXES = (
+    "pefile",
+    "pyelftools",
+    "olefile",
+    "pypdf",
+    "pillow",
+    "cryptography",
+    "cffi",
+    "pycparser",
+    "typing_extensions",
+)
+
 
 @dataclass(frozen=True)
 class RuntimeCopyPlan:
@@ -182,10 +209,11 @@ def path_is_under(path: Path, root: Path) -> bool:
 
 
 def extra_host_site_packages(install_root: Path | None = None) -> list[Path]:
-    """site-packages the child must read that are **not** inside the staged install.
+    """Active site-packages outside the base install that can feed staging.
 
-    A venv's site-packages lives outside the base CPython tree. Conda
-    site-packages sit under the install root and are copied with ``Lib``.
+    A venv's site-packages lives outside the base CPython tree. It is copied
+    selectively into the staged runtime, not granted to the child wholesale.
+    Conda site-packages sit under the install root and are handled separately.
     """
     install_root = (install_root or python_install_root()).resolve()
     found: list[Path] = []
@@ -273,21 +301,15 @@ def _ignore_skipped(directory: str, names: list[str]) -> set[str]:
 def copy_runtime(source: Path, dest: Path, *, include_site_packages: bool | None = None) -> None:
     """Copy only the planned runtime files into *dest* (must already exist).
 
-    When a venv's site-packages lives outside the install root, the install's
-    ``Lib/site-packages`` is skipped so a broken Conda copy cannot shadow the
-    venv (for example a cp310 Pillow wheel next to Python 3.11).
+    ``Lib/site-packages`` is never copied wholesale. Conda/venv environments can
+    contain many unrelated packages, caches, and tests; staging only the known
+    analyzer runtime imports keeps the AppContainer read ACL narrow and avoids
+    recursive ACL work over a large environment.
     """
     source = Path(source)
     dest = Path(dest)
     if include_site_packages is None:
         include_site_packages = True
-        try:
-            if source.resolve() == python_install_root().resolve() and extra_host_site_packages(
-                install_root=source
-            ):
-                include_site_packages = False
-        except OSError:
-            include_site_packages = True
     plan = runtime_copy_plan(source)
     dest.mkdir(parents=True, exist_ok=True)
     for name in plan.root_files:
@@ -301,7 +323,7 @@ def copy_runtime(source: Path, dest: Path, *, include_site_packages: bool | None
             continue
         dst_dir.parent.mkdir(parents=True, exist_ok=True)
         ignore = _ignore_skipped
-        if (not include_site_packages) and Path(relative).parts == ("Lib",):
+        if Path(relative).parts == ("Lib",):
             ignore = _ignore_lib_without_site_packages
         shutil.copytree(
             src_dir,
@@ -310,6 +332,8 @@ def copy_runtime(source: Path, dest: Path, *, include_site_packages: bool | None
             ignore=ignore,
             copy_function=shutil.copy2,
         )
+    if include_site_packages:
+        _copy_required_site_packages(source, dest)
     _copy_application_package(dest)
     if not (dest / "python.exe").is_file():
         raise OSError("failed to stage a user-owned python.exe for AppContainer")
@@ -322,6 +346,81 @@ def _ignore_lib_without_site_packages(directory: str, names: list[str]) -> set[s
             if name.lower() == "site-packages":
                 skipped.add(name)
     return skipped
+
+
+def runtime_site_package_sources(source: Path) -> list[Path]:
+    """Candidate site-packages roots, highest priority first.
+
+    A virtualenv's site-packages should win over its base interpreter. For a
+    Conda/base install, ``extra_host_site_packages`` returns nothing and the
+    install root's own site-packages is used selectively.
+    """
+    source = Path(source)
+    candidates = [*extra_host_site_packages(install_root=source), source / "Lib" / "site-packages"]
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not candidate.is_dir():
+            continue
+        seen.add(resolved)
+        found.append(candidate)
+    return found
+
+
+def _copy_required_site_packages(source: Path, dest_runtime: Path) -> None:
+    dest_site = dest_runtime / "Lib" / "site-packages"
+    copied_keys: set[str] = set()
+    for site in runtime_site_package_sources(source):
+        for entry in _iter_required_site_entries(site):
+            key = _site_entry_key(entry)
+            if key in copied_keys:
+                continue
+            _copy_site_entry(entry, dest_site / entry.name)
+            copied_keys.add(key)
+
+
+def _iter_required_site_entries(site: Path) -> list[Path]:
+    try:
+        names = sorted(os.listdir(site), key=str.lower)
+    except OSError:
+        return []
+    selected: list[Path] = []
+    required = {name.lower() for name in REQUIRED_RUNTIME_SITE_ENTRIES}
+    dist_prefixes = tuple(prefix.lower().replace("-", "_") for prefix in REQUIRED_RUNTIME_DIST_PREFIXES)
+    for name in names:
+        lowered = name.lower()
+        normalized = lowered.replace("-", "_")
+        path = site / name
+        if lowered in required:
+            selected.append(path)
+            continue
+        if lowered.startswith("_cffi_backend") and lowered.endswith((".pyd", ".dll", ".so")):
+            selected.append(path)
+            continue
+        if lowered.endswith((".dist-info", ".egg-info", ".libs")) and normalized.startswith(dist_prefixes):
+            selected.append(path)
+    return selected
+
+
+def _site_entry_key(path: Path) -> str:
+    name = path.name.lower().replace("-", "_")
+    if name.startswith("_cffi_backend"):
+        return "_cffi_backend"
+    return name
+
+
+def _copy_site_entry(src: Path, dst: Path) -> None:
+    if dst.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst, ignore=_ignore_skipped, copy_function=shutil.copy2)
+    elif src.is_file():
+        shutil.copy2(src, dst)
 
 
 def _copy_application_package(dest_runtime: Path) -> None:
