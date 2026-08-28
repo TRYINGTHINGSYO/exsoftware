@@ -33,7 +33,8 @@ _LOCK = threading.Lock()
 
 # Bump when the staged layout changes so fat historical copies are rebuilt.
 # Layout 5: identity includes a fingerprint of staged exsoftware package contents.
-RUNTIME_LAYOUT_VERSION = "5"
+# Layout 6: stage only analyzer site-packages entries, not the whole environment.
+RUNTIME_LAYOUT_VERSION = "6"
 
 # Directory names never copied from any Python install root (any depth).
 SKIP_DIR_NAMES = frozenset(
@@ -82,7 +83,9 @@ _ROOT_NAME_EXACT = frozenset({"python.exe", "pythonw.exe"})
 # omitted: AppContainer workers run analyzer modules, not the HTTP server.
 REQUIRED_RUNTIME_SITE_ENTRIES = (
     "pefile.py",
+    "ordlookup",
     "elftools",
+    "olefile",
     "olefile.py",
     "pypdf",
     "PIL",
@@ -94,10 +97,12 @@ REQUIRED_RUNTIME_SITE_ENTRIES = (
 )
 REQUIRED_RUNTIME_DIST_PREFIXES = (
     "pefile",
+    "ordlookup",
     "pyelftools",
     "olefile",
     "pypdf",
     "pillow",
+    "pil",
     "cryptography",
     "cffi",
     "pycparser",
@@ -211,15 +216,29 @@ def path_is_under(path: Path, root: Path) -> bool:
 def extra_host_site_packages(install_root: Path | None = None) -> list[Path]:
     """Active site-packages outside the base install that can feed staging.
 
-    A venv's site-packages lives outside the base CPython tree. It is copied
-    selectively into the staged runtime, not granted to the child wholesale.
-    Conda site-packages sit under the install root and are handled separately.
+    A venv's site-packages lives outside the base CPython tree. Per-user
+    ``pip install --user`` trees are also outside the install root. Both are
+    copied selectively into the staged runtime, not granted to the child
+    wholesale. Conda site-packages sit under the install root and are handled
+    separately.
     """
     install_root = (install_root or python_install_root()).resolve()
     found: list[Path] = []
     seen: set[Path] = set()
-    for prefix in (Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()):
-        site = prefix / "Lib" / "site-packages"
+    prefix = Path(sys.prefix).resolve()
+    candidates = [prefix / "Lib" / "site-packages"]
+    base_prefix = Path(sys.base_prefix).resolve()
+    if base_prefix != prefix:
+        candidates.append(base_prefix / "Lib" / "site-packages")
+    try:
+        import site as site_mod
+
+        user_site = site_mod.getusersitepackages()
+    except (AttributeError, OSError, TypeError):
+        user_site = None
+    if user_site:
+        candidates.append(Path(user_site))
+    for site in candidates:
         try:
             resolved = site.resolve()
         except OSError:
@@ -410,6 +429,8 @@ def _site_entry_key(path: Path) -> str:
     name = path.name.lower().replace("-", "_")
     if name.startswith("_cffi_backend"):
         return "_cffi_backend"
+    if name in {"olefile", "olefile.py"}:
+        return "olefile"
     return name
 
 

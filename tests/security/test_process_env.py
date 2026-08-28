@@ -42,6 +42,10 @@ def test_unix_pythonpath_includes_real_site_packages():
         assert lib_guess not in parts
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows child PYTHONPATH is the staged runtime; see test_staged_runtime_imports_worker_dependencies",
+)
 def test_isolated_child_can_import_runtime_dependencies():
     workdir = Path(tempfile.mkdtemp(prefix="exsoftware-child-env-"))
     try:

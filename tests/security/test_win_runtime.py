@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from exsoftware.isolate.acl_prep import PROCESS_ACL_CACHE, AclTimeoutError
+from exsoftware.isolate.process import host_site_package_dirs
+from exsoftware.isolate import winruntime
 from exsoftware.isolate.winruntime import (
     REQUIRED_RUNTIME_SITE_ENTRIES,
     RUNTIME_LAYOUT_VERSION,
     SKIP_DIR_NAMES,
+    _copy_required_site_packages,
     _runtime_complete,
     acl_sid_marker_name,
     application_package_fingerprint,
@@ -18,6 +24,7 @@ from exsoftware.isolate.winruntime import (
     copy_runtime,
     extra_host_site_packages,
     looks_like_conda_prefix,
+    path_is_under,
     runtime_copy_plan,
     runtime_site_package_sources,
     stage_cpython_tree,
@@ -40,6 +47,7 @@ def _fake_cpython(root: Path) -> Path:
     _write(root / "Lib" / "os.py")
     _write(root / "Lib" / "encodings" / "__init__.py")
     _write(root / "Lib" / "site-packages" / "pefile.py")
+    _write(root / "Lib" / "site-packages" / "ordlookup" / "__init__.py")
     _write(root / "Lib" / "test" / "test_os.py")
     _write(root / "Lib" / "idlelib" / "idle.py")
     return root
@@ -60,9 +68,33 @@ def _fake_conda(root: Path) -> Path:
     _write(root / "Lib" / "site-packages" / "fastapi" / "__init__.py")
     _write(root / "Lib" / "site-packages" / "uvicorn" / "__init__.py")
     _write(root / "Lib" / "site-packages" / "cryptography" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "cryptography" / "hazmat" / "bindings" / "_rust.pyd")
     _write(root / "Lib" / "site-packages" / "cryptography-99.dist-info" / "METADATA")
     _write(root / "Lib" / "site-packages" / "cryptography.libs" / "crypto.dll")
+    _write_olefile_package(root / "Lib" / "site-packages")
+    _write(root / "Lib" / "site-packages" / "PIL" / "__init__.py")
+    _write(root / "Lib" / "site-packages" / "PIL" / "_imaging.pyd")
+    _write(root / "Lib" / "site-packages" / "Pillow.libs" / "libpng.dll")
+    _write(root / "Lib" / "site-packages" / "_cffi_backend.pyd")
+    _write(root / "Lib" / "site-packages" / "cffi" / "__init__.py")
     return root
+
+
+def _write_olefile_package(site: Path) -> None:
+    """Realistic olefile 0.47 layout: a package directory, not olefile.py."""
+    _write(site / "olefile" / "__init__.py", "from .olefile import *\n")
+    _write(site / "olefile" / "olefile.py", "def isOleFile(filename): return False\n")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_user_site(monkeypatch, tmp_path, request):
+    """Keep copy_runtime fixtures from ingesting the live pip --user tree."""
+    if request.node.name == "test_staged_runtime_imports_worker_dependencies":
+        return
+    monkeypatch.setattr(
+        "site.getusersitepackages",
+        lambda: str(tmp_path / "no-user-site" / "site-packages"),
+    )
 
 
 def test_conda_style_runtime_path_selection_skips_pkgs_and_envs(tmp_path: Path):
@@ -90,9 +122,18 @@ def test_staged_runtime_excludes_unrelated_conda_directories(tmp_path: Path):
     assert (dest / "python.exe").is_file()
     assert (dest / "Lib" / "os.py").is_file()
     assert (dest / "Lib" / "site-packages" / "pefile.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "ordlookup" / "__init__.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "olefile" / "__init__.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "olefile" / "olefile.py").is_file()
     assert (dest / "Lib" / "site-packages" / "cryptography" / "__init__.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "cryptography" / "hazmat" / "bindings" / "_rust.pyd").is_file()
     assert (dest / "Lib" / "site-packages" / "cryptography-99.dist-info" / "METADATA").is_file()
     assert (dest / "Lib" / "site-packages" / "cryptography.libs" / "crypto.dll").is_file()
+    assert (dest / "Lib" / "site-packages" / "PIL" / "__init__.py").is_file()
+    assert (dest / "Lib" / "site-packages" / "PIL" / "_imaging.pyd").is_file()
+    assert (dest / "Lib" / "site-packages" / "Pillow.libs" / "libpng.dll").is_file()
+    assert (dest / "Lib" / "site-packages" / "_cffi_backend.pyd").is_file()
+    assert (dest / "Lib" / "site-packages" / "cffi" / "__init__.py").is_file()
     assert (dest / "Lib" / "site-packages" / "exsoftware" / "__init__.py").is_file()
     assert (dest / "zlib.dll").is_file()
     assert (dest / "Library" / "bin" / "sqlite3.dll").is_file()
@@ -111,6 +152,9 @@ def test_staged_runtime_excludes_unrelated_conda_directories(tmp_path: Path):
     for skipped in ("pkgs", "conda-meta", "envs", "docs", "tests"):
         assert skipped in SKIP_DIR_NAMES
     assert "pefile.py" in REQUIRED_RUNTIME_SITE_ENTRIES
+    assert "ordlookup" in REQUIRED_RUNTIME_SITE_ENTRIES
+    assert "olefile" in REQUIRED_RUNTIME_SITE_ENTRIES
+    assert "olefile.py" in REQUIRED_RUNTIME_SITE_ENTRIES
 
 
 def test_python_org_layout_copies_interpreter_and_stdlib(tmp_path: Path):
@@ -183,7 +227,9 @@ def test_conda_site_packages_under_install_root_are_not_extra_acl_targets(tmp_pa
     site.mkdir(parents=True)
     monkeypatch.setattr("exsoftware.isolate.winruntime.sys.prefix", str(root))
     monkeypatch.setattr("exsoftware.isolate.winruntime.sys.base_prefix", str(root))
-    assert extra_host_site_packages(install_root=root) == []
+    extra = extra_host_site_packages(install_root=root)
+    assert site.resolve() not in extra
+    assert all(not path_is_under(path, root) for path in extra)
 
 
 def test_venv_site_packages_are_extra_acl_targets(tmp_path: Path, monkeypatch):
@@ -198,6 +244,24 @@ def test_venv_site_packages_are_extra_acl_targets(tmp_path: Path, monkeypatch):
     assert site.resolve() in extra
 
 
+def test_user_site_packages_are_selectively_staged(tmp_path: Path, monkeypatch):
+    source = _fake_cpython(tmp_path / "Python314")
+    user_site = tmp_path / "usersite"
+    _write_olefile_package(user_site)
+    _write(user_site / "unrelated_user_pkg" / "__init__.py")
+    monkeypatch.setattr("site.getusersitepackages", lambda: str(user_site))
+    monkeypatch.setattr(winruntime.sys, "prefix", str(source))
+    monkeypatch.setattr(winruntime.sys, "base_prefix", str(source))
+
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(source, dest)
+    staged = dest / "Lib" / "site-packages"
+    assert (staged / "olefile" / "__init__.py").is_file()
+    assert (staged / "olefile" / "olefile.py").is_file()
+    assert not (staged / "unrelated_user_pkg").exists()
+
+
 def test_runtime_site_package_sources_prioritize_venv(tmp_path: Path, monkeypatch):
     base = _fake_conda(tmp_path / "miniconda3")
     venv = tmp_path / "venv"
@@ -206,8 +270,9 @@ def test_runtime_site_package_sources_prioritize_venv(tmp_path: Path, monkeypatc
     monkeypatch.setattr("exsoftware.isolate.winruntime.sys.prefix", str(venv))
     monkeypatch.setattr("exsoftware.isolate.winruntime.sys.base_prefix", str(base))
     sources = runtime_site_package_sources(base)
-    assert sources[0].resolve() == venv_site.resolve()
-    assert sources[1].resolve() == (base / "Lib" / "site-packages").resolve()
+    resolved = [path.resolve() for path in sources]
+    assert resolved[0] == venv_site.resolve()
+    assert (base / "Lib" / "site-packages").resolve() in resolved
 
 
 def test_venv_runtime_copies_required_packages_without_base_shadowing(tmp_path: Path, monkeypatch):
@@ -371,3 +436,171 @@ def test_copy_error_does_not_poison_process_acl_cache(tmp_path: Path, monkeypatc
     assert result == dest2
     assert grants2["n"] == 1
     assert (dest2 / "python.exe").is_file()
+
+
+def test_layout_5_runtime_is_not_reused_after_layout_6(tmp_path: Path, monkeypatch):
+    """Selective site-packages staging must not reuse a layout-5 cache directory."""
+    assert RUNTIME_LAYOUT_VERSION == "6"
+    src_root = tmp_path / "src"
+    _write(src_root / "exsoftware" / "__init__.py", "pkg")
+    monkeypatch.setattr(winruntime, "python_src_root", lambda: src_root)
+
+    source = _fake_cpython(tmp_path / "Python314")
+    monkeypatch.setattr(winruntime, "python_install_root", lambda: source)
+    monkeypatch.setattr(winruntime.sys, "version", "3.14.0-layout-bump")
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+
+    monkeypatch.setattr(winruntime, "RUNTIME_LAYOUT_VERSION", "5")
+    old_dest = staged_python_root()
+    stage_cpython_tree(source, old_dest, appcontainer_sid=None)
+    _write(old_dest / "Lib" / "site-packages" / "fastapi" / "__init__.py")
+    old_marker = old_dest / ".exsoftware-runtime-complete"
+    assert "layout=5" in old_marker.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(winruntime, "RUNTIME_LAYOUT_VERSION", "6")
+    new_dest = staged_python_root()
+    assert new_dest != old_dest
+    assert not _runtime_complete(old_marker, source)
+    assert (old_dest / "Lib" / "site-packages" / "fastapi" / "__init__.py").is_file()
+
+    first = stage_cpython_tree(source, new_dest, appcontainer_sid=None)
+    assert first == new_dest
+    new_marker = new_dest / ".exsoftware-runtime-complete"
+    assert "layout=6" in new_marker.read_text(encoding="utf-8")
+    assert not (new_dest / "Lib" / "site-packages" / "fastapi").exists()
+    assert staged_python_root() == new_dest
+
+    marker_mtime = new_marker.stat().st_mtime_ns
+    second = stage_cpython_tree(source, new_dest, appcontainer_sid=None)
+    assert second == new_dest
+    assert staged_python_root() == new_dest
+    assert new_marker.stat().st_mtime_ns == marker_mtime
+    # The old layout-5 tree is left in place; identity selection just ignores it.
+    assert (old_dest / "python.exe").is_file()
+    assert "layout=5" in old_marker.read_text(encoding="utf-8")
+
+
+def test_olefile_package_layout_is_staged(tmp_path: Path):
+    source = _fake_cpython(tmp_path / "Python314")
+    site = source / "Lib" / "site-packages"
+    _write_olefile_package(site)
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(source, dest)
+    staged = dest / "Lib" / "site-packages" / "olefile"
+    assert (staged / "__init__.py").is_file()
+    assert (staged / "olefile.py").is_file()
+    assert not (dest / "Lib" / "site-packages" / "olefile.py").exists()
+
+
+def test_legacy_olefile_module_is_still_staged(tmp_path: Path):
+    source = _fake_cpython(tmp_path / "Python314")
+    _write(source / "Lib" / "site-packages" / "olefile.py", "def isOleFile(filename): return False\n")
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(source, dest)
+    assert (dest / "Lib" / "site-packages" / "olefile.py").is_file()
+
+
+def test_native_analyzer_support_files_are_staged(tmp_path: Path):
+    source = _fake_cpython(tmp_path / "Python314")
+    site = source / "Lib" / "site-packages"
+    _write(site / "PIL" / "__init__.py")
+    _write(site / "PIL" / "_imaging.pyd")
+    _write(site / "Pillow.libs" / "libpng.dll")
+    _write(site / "PIL.libs" / "libjpeg.dll")
+    _write(site / "cryptography" / "__init__.py")
+    _write(site / "cryptography" / "hazmat" / "bindings" / "_rust.pyd")
+    _write(site / "cryptography.libs" / "crypto.dll")
+    _write(site / "_cffi_backend.cp314-win_amd64.pyd")
+    _write(site / "cffi" / "__init__.py")
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(source, dest)
+    staged = dest / "Lib" / "site-packages"
+    assert (staged / "PIL" / "_imaging.pyd").is_file()
+    assert (staged / "Pillow.libs" / "libpng.dll").is_file()
+    assert (staged / "PIL.libs" / "libjpeg.dll").is_file()
+    assert (staged / "cryptography" / "hazmat" / "bindings" / "_rust.pyd").is_file()
+    assert (staged / "cryptography.libs" / "crypto.dll").is_file()
+    assert (staged / "_cffi_backend.cp314-win_amd64.pyd").is_file()
+    assert (staged / "cffi" / "__init__.py").is_file()
+
+
+def test_staged_runtime_imports_worker_dependencies(tmp_path: Path, monkeypatch):
+    """Import analyzer deps from a selectively staged tree, not the live host site."""
+    host_sites = host_site_package_dirs()
+    assert host_sites, "expected host site-packages so selective copy has a source"
+    monkeypatch.setattr(winruntime, "runtime_site_package_sources", lambda _source: host_sites)
+
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    _copy_required_site_packages(tmp_path, dest)
+    staged_site = dest / "Lib" / "site-packages"
+    assert (staged_site / "olefile").is_dir() or (staged_site / "olefile.py").is_file()
+    assert not (staged_site / "fastapi").exists()
+
+    code = f"""
+import sys
+from pathlib import Path
+staged = Path({str(staged_site)!r})
+kept = [str(staged)]
+for item in sys.path:
+    name = Path(item).name.lower()
+    if name in {{"site-packages", "dist-packages"}}:
+        continue
+    if item and item not in kept:
+        kept.append(item)
+sys.path[:] = kept
+import pefile
+import elftools
+import olefile
+import pypdf
+import PIL
+import cryptography
+from PIL import Image
+from cryptography.hazmat.primitives.serialization import pkcs7
+for name, module in (
+    ("pefile", pefile),
+    ("elftools", elftools),
+    ("olefile", olefile),
+    ("pypdf", pypdf),
+    ("PIL", PIL),
+    ("cryptography", cryptography),
+):
+    location = getattr(module, "__file__", None) or ""
+    try:
+        Path(location).resolve().relative_to(staged.resolve())
+    except (ValueError, OSError):
+        raise SystemExit(f"{{name}} loaded from outside staged runtime: {{location}}")
+try:
+    import fastapi
+except ImportError:
+    pass
+else:
+    raise SystemExit("fastapi must not be importable from the staged runtime")
+print("ok")
+"""
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONSAFEPATH": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "SystemRoot": os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or r"C:\Windows",
+        "SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or r"C:\Windows",
+    }
+    if sys.platform == "win32":
+        env["PATHEXT"] = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        env["WINDIR"] = os.environ.get("WINDIR") or env["SystemRoot"]
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "ok" in completed.stdout
