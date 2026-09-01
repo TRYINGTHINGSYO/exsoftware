@@ -48,9 +48,9 @@ class IsolationPolicy:
     network_restriction: CapabilityState = "unsupported"
     memory_limit: CapabilityState = "unsupported"
     cpu_limit: CapabilityState = "unsupported"
-    wall_clock: CapabilityState = "enforced"
-    output_limit: CapabilityState = "enforced"
-    temporary_storage: CapabilityState = "enforced"
+    wall_clock: CapabilityState = "unsupported"
+    output_limit: CapabilityState = "unsupported"
+    temporary_storage: CapabilityState = "unsupported"
     process_creation: CapabilityState = "unsupported"
 
     reasons: dict[str, str] = field(default_factory=dict)
@@ -72,6 +72,20 @@ class IsolationPolicy:
 
     def capabilities(self) -> dict[str, str]:
         return {name: getattr(self, name) for name in CAPABILITIES}
+
+    def establish(self, capability: str, reason: str) -> None:
+        """Record a protection only after the parent established it."""
+        if capability not in CAPABILITIES:
+            raise ValueError(f"unknown isolation capability: {capability}")
+        setattr(self, capability, "enforced")
+        self.reasons[capability] = reason
+
+    def fail(self, capability: str, reason: str) -> None:
+        """Record that setup was attempted but did not establish a protection."""
+        if capability not in CAPABILITIES:
+            raise ValueError(f"unknown isolation capability: {capability}")
+        setattr(self, capability, "failed")
+        self.reasons[capability] = reason
 
     def to_dict(self) -> dict[str, Any]:
         return {

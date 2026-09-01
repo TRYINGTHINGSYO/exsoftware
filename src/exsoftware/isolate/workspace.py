@@ -23,9 +23,13 @@ def create_workspace() -> Path:
     base = Path(tempfile.gettempdir()) / "exsoftware-isolate"
     base.mkdir(parents=True, exist_ok=True)
     path = Path(tempfile.mkdtemp(prefix="w-", dir=str(base)))
-    _restrict_workspace(path)
-    if _is_reparse(path):
-        raise OSError("workspace resolved to a reparse point")
+    try:
+        _restrict_workspace(path)
+        if _is_reparse(path):
+            raise OSError("workspace resolved to a reparse point")
+    except Exception:
+        rmtree_retry(path)
+        raise
     return path
 
 
@@ -33,12 +37,9 @@ def _restrict_workspace(path: Path) -> None:
     if os.name != "nt":
         os.chmod(path, 0o700)
         return
-    try:
-        from .winacl import restrict_directory_to_current_user
+    from .winacl import restrict_directory_to_current_user
 
-        restrict_directory_to_current_user(path)
-    except OSError:
-        pass
+    restrict_directory_to_current_user(path)
 
 
 def _is_reparse(path: Path) -> bool:

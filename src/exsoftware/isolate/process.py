@@ -213,15 +213,40 @@ def spawn_worker(
         "protocol_version": PROTOCOL_VERSION,
         "sandbox": False,
     }
-    stdout.start()
-    stderr.start()
-    if sys.platform == "win32":
-        child, launch_meta = _spawn_windows(command, workdir, env, policy, stdout, stderr)
-        meta.update(launch_meta)
-        return child, meta
-    child, launch_meta = _spawn_unix(command, workdir, env, policy, stdout, stderr)
+    try:
+        stdout.start()
+        stderr.start()
+    except Exception as exc:
+        policy.fail("output_limit", f"Bounded stdout/stderr setup failed: {exc}")
+        raise
+    policy.establish("output_limit", "Bounded stdout/stderr drainers started")
+    try:
+        if sys.platform == "win32":
+            child, launch_meta = _spawn_windows(command, workdir, env, policy, stdout, stderr)
+        else:
+            child, launch_meta = _spawn_unix(command, workdir, env, policy, stdout, stderr)
+    except Exception as exc:
+        policy.fail("process_boundary", f"Worker process creation failed: {exc}")
+        policy.fail("wall_clock", f"No worker process was returned for timeout enforcement: {exc}")
+        raise
+    policy.establish("process_boundary", "Worker process created and retained by the parent")
+    policy.establish("wall_clock", "Parent retained the worker process for timeout and termination")
     meta.update(launch_meta)
     return child, meta
+
+
+def create_output_streams(policy: IsolationPolicy) -> tuple[BoundedStream, BoundedStream]:
+    """Create both bounded pipes without claiming enforcement before drain starts."""
+    stdout: BoundedStream | None = None
+    try:
+        stdout = BoundedStream(limit=policy.max_output_bytes)
+        stderr = BoundedStream(limit=policy.max_output_bytes)
+        return stdout, stderr
+    except Exception as exc:
+        policy.fail("output_limit", f"Bounded stdout/stderr pipe creation failed: {exc}")
+        if stdout is not None:
+            stdout.finish()
+        raise
 
 
 def _spawn_windows(command, workdir, env, policy, stdout, stderr):

@@ -46,7 +46,7 @@ Findings gained `rule_id`, `rule_version`, `certainty`, `artifact_id`, `evidence
 | `findings` | array | Interpretations |
 | `analyzer_runs` | array | Per-artifact analyzer outcomes |
 | `analyzers` | array | Root-only legacy projection |
-| `limits` | object | Size caps, recursion caps, `executed: false` |
+| `limits` | object | Size caps, recursion caps, `executed: false`, and report-wide worker isolation evidence |
 | `overview` | string | Deterministic summary |
 | `next_steps` | array | Deterministic checklist |
 | `composition` | object | Derived software-composition explanation. Additive in 0.6.0. Not canonical evidence. See [COMPOSITION.md](COMPOSITION.md). |
@@ -139,3 +139,30 @@ Findings gained `rule_id`, `rule_version`, `certainty`, `artifact_id`, `evidence
 ```
 
 Load with `Report.from_dict(json.loads(text))`.
+
+## Worker isolation inventory
+
+`limits.isolation.workers[]` is an additive schema-1 field containing every
+analyzer, archive broker, and OLE broker worker that was launched or whose
+launch was attempted for the analysis. Each row records:
+
+- `worker_type`, `worker_id`, `artifact_id`, and the analyzer `run_id` when applicable
+- worker outcome `status` and whether a child was actually `launched`
+- the actual `mechanism`, complete per-worker `capabilities`, fallback state,
+  and non-enforced `weaker_capabilities`
+- protocol identity plus bounded launch/token/job/policy evidence relevant to
+  understanding a downgrade
+
+The sibling `limits.isolation.mechanism` and `.capabilities` fields remain for
+compatibility, but are conservative aggregates over the complete worker list.
+`mechanism` is `mixed` when executed workers used different mechanisms or when
+an attempted worker did not launch alongside launched workers. `mechanisms`
+lists the actual mechanisms, and `mechanism_counts` includes `not-launched`.
+
+Capability aggregation uses this weakest-to-strongest order:
+`failed`, `unsupported`, `degraded`, `enforced`. The aggregate for a capability
+is the weakest state reported by any worker. `capability_counts` shows the
+per-state counts used to produce each aggregate.
+
+Old schema-1 reports without `workers` remain loadable. Readers that do not
+recognize the additive fields can continue using the corrected legacy summary.

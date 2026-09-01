@@ -83,7 +83,9 @@ def _icacls(args: list[str]) -> subprocess.CompletedProcess[bytes]:
 
 def restrict_directory_to_current_user(path: Path) -> None:
     sid = current_user_sid()
-    _icacls([str(path), "/inheritance:r", "/Q"])
+    completed = _icacls([str(path), "/inheritance:r", "/Q"])
+    if completed.returncode != 0:
+        raise OSError(completed.returncode, completed.stderr.decode("utf-8", "replace"))
     for ace in (f"*{sid}:(OI)(CI)(F)", "*S-1-5-18:(OI)(CI)(F)"):
         completed = _icacls([str(path), "/grant:r", ace, "/Q"])
         if completed.returncode != 0:
