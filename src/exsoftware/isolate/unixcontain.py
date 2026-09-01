@@ -107,10 +107,6 @@ def describe_unix_support() -> dict[str, Any]:
 
 
 def apply_unix_policy(policy: IsolationPolicy, *, unshare_applied: bool, landlock_applied: bool, rlimit_cpu: bool, rlimit_as: bool) -> None:
-    policy.process_boundary = "enforced"
-    policy.wall_clock = "enforced"
-    policy.output_limit = "enforced"
-    policy.temporary_storage = "enforced"
     policy.process_tree_limit = "enforced"
     policy.reasons["process_tree_limit"] = "Child started in a new session; timeout uses killpg"
     if policy.max_processes <= 1 and sys.platform == "linux":

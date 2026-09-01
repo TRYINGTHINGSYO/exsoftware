@@ -98,6 +98,16 @@ Each analyzer run records `details.isolation.capabilities` with only:
 
 `exsoftware security-status` runs hostile helper analyzers and **will not report enforced if the forbidden operation succeeded**.
 
+Analysis reports also contain `limits.isolation.workers[]`, a report-wide
+inventory of analyzer, ZIP/container broker, and OLE broker worker attempts.
+The legacy `limits.isolation.mechanism` and `capabilities` values are computed
+from that complete inventory rather than copied from one analyzer. A stronger
+worker cannot hide a weaker worker: different mechanisms are reported as
+`mixed`, failed launches remain explicit, and every capability is aggregated
+using the weakest worker state (`failed` → `unsupported` → `degraded` →
+`enforced`). Per-worker capabilities and launch/fallback evidence remain in the
+inventory so an aggregate downgrade is explainable.
+
 ## Workspace / IPC
 
 The child receives `input.bin` in a random workspace. Original host paths are not placed in the request. Response files are opened without following reparse points/symlinks. Stdout/stderr are capped.

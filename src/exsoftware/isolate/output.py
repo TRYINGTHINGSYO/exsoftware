@@ -10,9 +10,22 @@ from typing import Any
 class BoundedStream:
     def __init__(self, *, limit: int) -> None:
         self.limit = max(0, int(limit))
-        self._read_fd, self._write_fd = os.pipe()
-        os.set_inheritable(self._write_fd, True)
-        os.set_inheritable(self._read_fd, False)
+        self._read_fd = -1
+        self._write_fd = -1
+        try:
+            self._read_fd, self._write_fd = os.pipe()
+            os.set_inheritable(self._write_fd, True)
+            os.set_inheritable(self._read_fd, False)
+        except Exception:
+            for fd in (self._read_fd, self._write_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._read_fd = -1
+            self._write_fd = -1
+            raise
         self.captured = bytearray()
         self.truncated = False
         self.discarded = 0
@@ -77,3 +90,19 @@ class BoundedStream:
             if extra:
                 self.truncated = True
                 self.discarded += len(extra)
+
+
+def finish_streams(
+    stdout: BoundedStream | None,
+    stderr: BoundedStream | None,
+) -> dict[str, dict[str, Any]]:
+    """Close whichever capture streams were created, including partial setup."""
+    finished: dict[str, dict[str, Any]] = {}
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        if stream is None:
+            continue
+        try:
+            finished[name] = stream.finish()
+        except Exception as exc:
+            finished[name] = {"finish_error": str(exc) or exc.__class__.__name__}
+    return finished

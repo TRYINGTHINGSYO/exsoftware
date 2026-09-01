@@ -13,9 +13,9 @@ from ..content import digest_bytes
 from ..context import AnalysisContext
 from ..limits import RecursionLimits
 from ..models import AnalyzerError, AnalyzerResult
-from .output import BoundedStream
+from .output import BoundedStream, finish_streams
 from .policy import IsolationPolicy
-from .process import child_env, close_job, pid_alive, spawn_worker, terminate_tree, wait_or_timeout
+from .process import child_env, close_job, create_output_streams, pid_alive, spawn_worker, terminate_tree, wait_or_timeout
 from .protocol import (
     PROTOCOL_NAME,
     PROTOCOL_VERSION,
@@ -67,8 +67,8 @@ class IsolatedAnalyzerRunner:
         policy.timeout_seconds = timeout
         workdir: Path | None = None
         proc = None
-        stdout = BoundedStream(limit=policy.max_output_bytes)
-        stderr = BoundedStream(limit=policy.max_output_bytes)
+        stdout: BoundedStream | None = None
+        stderr: BoundedStream | None = None
         isolation: dict[str, Any] = {
             "mode": "subprocess",
             "protocol": PROTOCOL_NAME,
@@ -78,7 +78,15 @@ class IsolatedAnalyzerRunner:
             "containment": "static-parser",
         }
         try:
-            workdir = create_workspace()
+            try:
+                workdir = create_workspace()
+            except Exception as exc:
+                policy.fail("temporary_storage", f"Isolated workspace setup failed: {exc}")
+                raise
+            policy.establish(
+                "temporary_storage",
+                "Isolated workspace created and access restrictions applied",
+            )
             isolation["workdir"] = str(workdir)
             (workdir / INPUT_NAME).write_bytes(ctx.data)
             digest = digest_bytes(ctx.data)
@@ -110,6 +118,7 @@ class IsolatedAnalyzerRunner:
             )
             (workdir / REQUEST_NAME).write_text(json.dumps(request, default=str), encoding="utf-8")
             env = child_env(test_mode=test_mode, workdir=workdir)
+            stdout, stderr = create_output_streams(policy)
             proc, spawn_meta = spawn_worker(
                 workdir=workdir,
                 env=env,
@@ -125,10 +134,7 @@ class IsolatedAnalyzerRunner:
             if rc is None:
                 isolation["termination"] = terminate_tree(proc)
                 isolation["still_alive"] = proc.poll() is None
-            isolation["stdio"] = {
-                "stdout": stdout.finish(),
-                "stderr": stderr.finish(),
-            }
+            isolation["stdio"] = finish_streams(stdout, stderr)
             if rc is None:
                 result = _status_result(
                     spec,
@@ -147,11 +153,10 @@ class IsolatedAnalyzerRunner:
         except Exception as exc:
             isolation["spawn_error"] = str(exc)
             isolation["traceback"] = traceback.format_exc()
-            isolation.setdefault("capabilities", policy.capabilities())
-            try:
-                isolation["stdio"] = {"stdout": stdout.finish(), "stderr": stderr.finish()}
-            except Exception:
-                pass
+            isolation["capabilities"] = policy.capabilities()
+            isolation["mechanism"] = policy.mechanism
+            isolation["policy"] = policy.to_dict()
+            isolation["stdio"] = finish_streams(stdout, stderr)
             result = _status_result(
                 spec,
                 status="failed",

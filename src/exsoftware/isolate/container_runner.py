@@ -24,9 +24,9 @@ from .container_protocol import (
     validate_container_request,
     validate_container_response,
 )
-from .output import BoundedStream
+from .output import BoundedStream, finish_streams
 from .policy import IsolationPolicy
-from .process import child_env, close_job, spawn_worker, terminate_tree, wait_or_timeout
+from .process import child_env, close_job, create_output_streams, spawn_worker, terminate_tree, wait_or_timeout
 from .protocol import (
     REASON_CHILD_CRASH,
     REASON_CHILD_EXIT,
@@ -114,8 +114,8 @@ class IsolatedContainerRunner:
         policy.timeout_seconds = timeout
         workdir: Path | None = None
         proc = None
-        stdout = BoundedStream(limit=policy.max_output_bytes)
-        stderr = BoundedStream(limit=policy.max_output_bytes)
+        stdout: BoundedStream | None = None
+        stderr: BoundedStream | None = None
         isolation: dict[str, Any] = {
             "mode": "subprocess",
             "protocol": CONTAINER_PROTOCOL,
@@ -126,7 +126,15 @@ class IsolatedContainerRunner:
         }
         started = perf_counter()
         try:
-            workdir = create_workspace()
+            try:
+                workdir = create_workspace()
+            except Exception as exc:
+                policy.fail("temporary_storage", f"Isolated workspace setup failed: {exc}")
+                raise
+            policy.establish(
+                "temporary_storage",
+                "Isolated workspace created and access restrictions applied",
+            )
             isolation["workdir"] = str(workdir)
             (workdir / INPUT_NAME).write_bytes(data)
             from ..content import sha256_hex
@@ -157,6 +165,7 @@ class IsolatedContainerRunner:
             (workdir / REQUEST_NAME).write_text(json.dumps(request), encoding="utf-8")
             test_mode = os.environ.get(TEST_ENV) == "1" or bool(test_hook)
             env = child_env(test_mode=test_mode, workdir=workdir)
+            stdout, stderr = create_output_streams(policy)
             proc, spawn_meta = spawn_worker(
                 workdir=workdir,
                 env=env,
@@ -167,10 +176,11 @@ class IsolatedContainerRunner:
             isolation.update(spawn_meta)
             isolation["capabilities"] = policy.capabilities()
             isolation["mechanism"] = policy.mechanism
+            isolation["policy"] = policy.to_dict()
             rc = wait_or_timeout(proc, timeout)
             if rc is None:
                 isolation["termination"] = terminate_tree(proc)
-                isolation["stdio"] = {"stdout": stdout.finish(), "stderr": stderr.finish()}
+                isolation["stdio"] = finish_streams(stdout, stderr)
                 isolation["duration_ms"] = (perf_counter() - started) * 1000
                 return ContainerResult(
                     status="timeout",
@@ -182,16 +192,15 @@ class IsolatedContainerRunner:
                     message=f"Container worker exceeded {timeout} seconds and was terminated.",
                 )
             isolation["returncode"] = rc
-            isolation["stdio"] = {"stdout": stdout.finish(), "stderr": stderr.finish()}
+            isolation["stdio"] = finish_streams(stdout, stderr)
             return self._ingest(workdir, artifact_id, isolation, rc, started)
         except Exception as exc:
             isolation["spawn_error"] = str(exc)
             isolation["traceback"] = traceback.format_exc()
-            isolation.setdefault("capabilities", policy.capabilities())
-            try:
-                isolation["stdio"] = {"stdout": stdout.finish(), "stderr": stderr.finish()}
-            except Exception:
-                pass
+            isolation["capabilities"] = policy.capabilities()
+            isolation["mechanism"] = policy.mechanism
+            isolation["policy"] = policy.to_dict()
+            isolation["stdio"] = finish_streams(stdout, stderr)
             return ContainerResult(
                 status="failed",
                 reason=REASON_SPAWN_FAILED,

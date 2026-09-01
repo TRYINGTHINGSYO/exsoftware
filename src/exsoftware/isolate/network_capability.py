@@ -18,9 +18,9 @@ from ..content import digest_bytes
 from ..context import AnalysisContext
 from ..limits import RecursionLimits
 from ..models import FileIdentity
-from .output import BoundedStream
+from .output import BoundedStream, finish_streams
 from .policy import IsolationPolicy
-from .process import child_env, close_job, spawn_worker, terminate_tree, wait_or_timeout
+from .process import child_env, close_job, create_output_streams, spawn_worker, terminate_tree, wait_or_timeout
 from .protocol import (
     PROTOCOL_NAME,
     PROTOCOL_VERSION,
@@ -342,8 +342,8 @@ def probe_host_to_worker_listen(
     policy.timeout_seconds = float(limits.analyzer_timeout_seconds)
     workdir: Path | None = None
     proc = None
-    stdout = BoundedStream(limit=policy.max_output_bytes)
-    stderr = BoundedStream(limit=policy.max_output_bytes)
+    stdout: BoundedStream | None = None
+    stderr: BoundedStream | None = None
     observed: dict[str, Any] = {
         "listen_bind_succeeded": False,
         "listen_bind_v6_succeeded": False,
@@ -364,7 +364,15 @@ def probe_host_to_worker_listen(
         "ready_validation_error": None,
     }
     try:
-        workdir = create_workspace()
+        try:
+            workdir = create_workspace()
+        except Exception as exc:
+            policy.fail("temporary_storage", f"Isolated workspace setup failed: {exc}")
+            raise
+        policy.establish(
+            "temporary_storage",
+            "Isolated workspace created and access restrictions applied",
+        )
         payload = b"network-listen-probe"
         (workdir / INPUT_NAME).write_bytes(payload)
         digest = digest_bytes(payload)
@@ -411,6 +419,7 @@ def probe_host_to_worker_listen(
         )
         (workdir / REQUEST_NAME).write_text(json.dumps(request, default=str), encoding="utf-8")
         env = child_env(test_mode=True, workdir=workdir)
+        stdout, stderr = create_output_streams(policy)
         proc, spawn_meta = spawn_worker(
             workdir=workdir,
             env=env,
@@ -500,10 +509,14 @@ def probe_host_to_worker_listen(
         return observed
     except Exception as exc:
         observed["probe_error"] = str(exc) or exc.__class__.__name__
+        observed["mechanism"] = policy.mechanism
+        observed["capabilities"] = policy.capabilities()
+        observed["policy"] = policy.to_dict()
         observed["listen_comm_completed"] = False
         _demote_unconfirmed_denials(observed)
         return observed
     finally:
+        observed["stdio"] = finish_streams(stdout, stderr)
         if proc is not None:
             if proc.poll() is None:
                 terminate_tree(proc)

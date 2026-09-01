@@ -14,6 +14,11 @@ from .context import DEFAULT_MAX_BYTES, AnalysisContext, load_from_bytes, load_f
 from .identify import identify_bytes, refine_ole_type_from_streams, refine_zip_type_from_names
 from .investigation import Investigation
 from .isolate.container_runner import IsolatedContainerRunner
+from .isolate.inventory import (
+    aggregate_worker_isolation,
+    analyzer_worker_isolation_record,
+    worker_isolation_record,
+)
 from .isolate.ole_runner import IsolatedOleRunner
 from .isolate.runner import IsolatedAnalyzerRunner
 from .limits import RecursionLimits
@@ -94,7 +99,11 @@ def _analyze_context(ctx: AnalysisContext, *, limits: RecursionLimits | None) ->
         },
     )
     ctx.artifact_id = artifact.id
-    stats: dict[str, Any] = {"extracted_count": 0, "extracted_bytes": 0, "container_isolation": None, "ole_isolation": None}
+    stats: dict[str, Any] = {
+        "extracted_count": 0,
+        "extracted_bytes": 0,
+        "broker_workers": [],
+    }
     members = _maybe_open_container(ctx, inv, stats)
     _maybe_refine_ole(ctx, inv, stats)
     root_sections = _run_analyzers(ctx, inv)
@@ -103,7 +112,7 @@ def _analyze_context(ctx: AnalysisContext, *, limits: RecursionLimits | None) ->
     hash_section = next((item for item in root_sections if item.name == "hashes"), None)
     if hash_section:
         report_hashes = dict(hash_section.details.get("hashes") or report_hashes)
-    return _build_report(ctx, inv, report_hashes, root_sections, limits)
+    return _build_report(ctx, inv, report_hashes, root_sections, limits, stats)
 
 
 def _run_analyzers(ctx: AnalysisContext, inv: Investigation) -> list[AnalyzerResult]:
@@ -234,7 +243,17 @@ def _maybe_open_container(ctx: AnalysisContext, inv: Investigation, stats: dict[
         timeout=limits.analyzer_timeout_seconds,
         extract_contents=limits.enable_recursion,
     )
-    stats["container_isolation"] = result.isolation
+    stats["broker_workers"].append(
+        worker_isolation_record(
+            worker_type="archive_broker",
+            worker_id="zip",
+            artifact_id=ctx.artifact_id or "",
+            status=result.status,
+            isolation=result.isolation,
+            reason=result.reason,
+            message=result.message,
+        )
+    )
     ctx.extra["container_inspected"] = True
     _apply_zip_identity(ctx, inv, *refine_zip_type_from_names([item.original_name for item in result.members]))
     if result.status != "completed":
@@ -423,7 +442,17 @@ def _maybe_refine_ole(ctx: AnalysisContext, inv: Investigation, stats: dict[str,
         artifact_id=ctx.artifact_id or "",
         timeout=limits.analyzer_timeout_seconds,
     )
-    stats["ole_isolation"] = result.isolation
+    stats["broker_workers"].append(
+        worker_isolation_record(
+            worker_type="ole_broker",
+            worker_id="ole-refine",
+            artifact_id=ctx.artifact_id or "",
+            status=result.status,
+            isolation=result.isolation,
+            reason=result.reason,
+            message=result.message,
+        )
+    )
     extra = dict(identity.extra or {})
     extra.pop("ole_subtype_pending", None)
     if result.status != "completed":
@@ -513,6 +542,7 @@ def _build_report(
     hashes: dict[str, str],
     root_sections: list[AnalyzerResult],
     limits: RecursionLimits,
+    stats: dict[str, Any],
 ) -> Report:
     identity = ctx.identity
     assert identity is not None
@@ -529,14 +559,13 @@ def _build_report(
                     "note": "Derived from imported APIs. This is capability, not observed runtime behavior.",
                 }
             )
-    isolation_caps = {}
-    isolation_mech = None
-    for section in root_sections:
-        iso = (section.details or {}).get("isolation") or {}
-        if iso.get("capabilities"):
-            isolation_caps = iso["capabilities"]
-            isolation_mech = iso.get("mechanism")
-            break
+    analyzer_workers = [
+        item
+        for run in inv.runs
+        if (item := analyzer_worker_isolation_record(run)) is not None
+    ]
+    worker_inventory = [*(stats.get("broker_workers") or []), *analyzer_workers]
+    isolation_summary = aggregate_worker_isolation(worker_inventory)
     report = Report(
         schema_version=SCHEMA_VERSION,
         analyzed_at=datetime.now(tz=UTC).isoformat(),
@@ -561,8 +590,8 @@ def _build_report(
                 "protocol_version": 1,
                 "sandbox": False,
                 "containment": "static-parser",
-                "mechanism": isolation_mech,
-                "capabilities": isolation_caps,
+                **isolation_summary,
+                "workers": worker_inventory,
                 "container_protocol": "exsoftware.container",
                 "container_protocol_version": 1,
                 "ole_protocol": "exsoftware.ole",

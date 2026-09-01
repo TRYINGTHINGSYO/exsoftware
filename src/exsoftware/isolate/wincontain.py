@@ -631,10 +631,6 @@ def query_child_token(child: WindowsChild) -> dict[str, Any]:
 
 def apply_policy_from_launch(policy: IsolationPolicy, meta: dict[str, Any], job: Any) -> None:
     policy.mechanism = meta.get("mechanism") or "none"
-    policy.process_boundary = "enforced"
-    policy.wall_clock = "enforced"
-    policy.output_limit = "enforced"
-    policy.temporary_storage = "enforced"
     job_assigned = bool(job and getattr(job, "assigned", False))
     policy.evidence["job_assigned"] = job_assigned
     policy.evidence.update({k: v for k, v in meta.items() if k != "appcontainer_paths_granted"})
