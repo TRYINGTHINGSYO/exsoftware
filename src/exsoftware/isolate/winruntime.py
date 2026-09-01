@@ -213,6 +213,35 @@ def path_is_under(path: Path, root: Path) -> bool:
         return False
 
 
+def _running_interpreter_install_roots() -> list[Path]:
+    """Install prefixes that belong to the currently running interpreter."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in (
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(getattr(sys, "_base_executable", sys.executable)).parent,
+    ):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
+
+
+def _install_root_is_running_interpreter(install_root: Path) -> bool:
+    """True when *install_root* is the live interpreter prefix or its base."""
+    try:
+        resolved = Path(install_root).resolve()
+    except OSError:
+        return False
+    return resolved in set(_running_interpreter_install_roots())
+
+
 def extra_host_site_packages(install_root: Path | None = None) -> list[Path]:
     """Active site-packages outside the base install that can feed staging.
 
@@ -221,8 +250,15 @@ def extra_host_site_packages(install_root: Path | None = None) -> list[Path]:
     copied selectively into the staged runtime, not granted to the child
     wholesale. Conda site-packages sit under the install root and are handled
     separately.
+
+    These extra live-interpreter sites are only mixed in when *install_root*
+    is the running interpreter (venv prefix, base prefix, or base executable
+    directory). An unrelated or fake runtime root must not inherit packages
+    from the process that happens to be performing the copy.
     """
     install_root = (install_root or python_install_root()).resolve()
+    if not _install_root_is_running_interpreter(install_root):
+        return []
     found: list[Path] = []
     seen: set[Path] = set()
     prefix = Path(sys.prefix).resolve()
@@ -370,9 +406,11 @@ def _ignore_lib_without_site_packages(directory: str, names: list[str]) -> set[s
 def runtime_site_package_sources(source: Path) -> list[Path]:
     """Candidate site-packages roots, highest priority first.
 
-    A virtualenv's site-packages should win over its base interpreter. For a
-    Conda/base install, ``extra_host_site_packages`` returns nothing and the
-    install root's own site-packages is used selectively.
+    A virtualenv's site-packages should win over its base interpreter when
+    *source* is that live interpreter. For a Conda/base install,
+    ``extra_host_site_packages`` returns nothing and the install root's own
+    site-packages is used selectively. For an unrelated runtime root, extra
+    live-host sites are omitted so host packages cannot shadow the source.
     """
     source = Path(source)
     candidates = [*extra_host_site_packages(install_root=source), source / "Lib" / "site-packages"]

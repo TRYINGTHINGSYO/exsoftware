@@ -291,6 +291,49 @@ def test_venv_runtime_copies_required_packages_without_base_shadowing(tmp_path: 
     assert not (dest / "Lib" / "site-packages" / "unrelated_big_pkg").exists()
 
 
+def test_unrelated_runtime_source_is_not_contaminated_by_live_host_packages(
+    tmp_path: Path, monkeypatch
+):
+    """A fake runtime root must not inherit packages from the running interpreter.
+
+    Host PIL/olefile entries share ``_site_entry_key`` with the source copies, so
+    mixing live site-packages in first would hide the source's ``_imaging.pyd``
+    and legacy ``olefile.py``.
+    """
+    live = tmp_path / "live-miniconda"
+    _write(live / "python.exe")
+    live_site = live / "Lib" / "site-packages"
+    _write(live_site / "PIL" / "__init__.py", "live-pil-without-imaging")
+    _write(live_site / "olefile" / "__init__.py", "live-olefile-package")
+    _write(live_site / "pefile.py", "live-pefile")
+
+    source = _fake_cpython(tmp_path / "unrelated-python")
+    src_site = source / "Lib" / "site-packages"
+    _write(src_site / "PIL" / "__init__.py", "source-pil")
+    _write(src_site / "PIL" / "_imaging.pyd")
+    _write(src_site / "olefile.py", "legacy-olefile")
+    _write(src_site / "pefile.py", "source-pefile")
+
+    monkeypatch.setattr(winruntime.sys, "prefix", str(live))
+    monkeypatch.setattr(winruntime.sys, "base_prefix", str(live))
+    monkeypatch.setattr(winruntime.sys, "_base_executable", str(live / "python.exe"))
+
+    assert extra_host_site_packages(install_root=source) == []
+    resolved_sources = [path.resolve() for path in runtime_site_package_sources(source)]
+    assert live_site.resolve() not in resolved_sources
+    assert src_site.resolve() in resolved_sources
+
+    dest = tmp_path / "staged"
+    dest.mkdir()
+    copy_runtime(source, dest)
+    staged = dest / "Lib" / "site-packages"
+    assert (staged / "PIL" / "__init__.py").read_text(encoding="utf-8") == "source-pil"
+    assert (staged / "PIL" / "_imaging.pyd").is_file()
+    assert (staged / "olefile.py").read_text(encoding="utf-8") == "legacy-olefile"
+    assert not (staged / "olefile").exists()
+    assert (staged / "pefile.py").read_text(encoding="utf-8") == "source-pefile"
+
+
 def test_stage_acl_failure_is_reused_without_retry(tmp_path: Path):
     source = _fake_cpython(tmp_path / "Python314")
     dest = tmp_path / "runtime"
