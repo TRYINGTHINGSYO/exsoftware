@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from exsoftware.isolate.process import child_env, host_site_package_dirs, pythonpath_for_child
+import exsoftware.isolate.process as process
+from exsoftware.isolate.process import (
+    child_env,
+    host_site_package_dirs,
+    pythonpath_for_child,
+    windows_child_path_entries,
+)
+from exsoftware.isolate.winruntime import staged_python_root
 from exsoftware.isolate.workspace import rmtree_retry
 
 
@@ -35,6 +42,10 @@ def test_unix_pythonpath_includes_real_site_packages():
         assert lib_guess not in parts
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows child PYTHONPATH is the staged runtime; see test_staged_runtime_imports_worker_dependencies",
+)
 def test_isolated_child_can_import_runtime_dependencies():
     workdir = Path(tempfile.mkdtemp(prefix="exsoftware-child-env-"))
     try:
@@ -56,3 +67,25 @@ def test_isolated_child_can_import_runtime_dependencies():
         assert "ok" in completed.stdout
     finally:
         rmtree_retry(workdir)
+
+
+def test_windows_pythonpath_uses_only_staged_runtime(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(process.sys, "platform", "win32")
+    monkeypatch.setenv("TEMP", str(tmp_path / "temp"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "live-src"))
+
+    parts = [part for part in process.pythonpath_for_child().split(os.pathsep) if part]
+    assert parts == [str(staged_python_root() / "Lib" / "site-packages")]
+    assert str(tmp_path / "live-src") not in parts
+
+
+def test_windows_child_path_excludes_live_venv_scripts(tmp_path: Path):
+    staged_python = tmp_path / "runtime" / "python.exe"
+    staged_python.parent.mkdir(parents=True)
+    staged_python.write_text("x", encoding="utf-8")
+    venv = tmp_path / "venv"
+
+    entries = windows_child_path_entries(staged_python, str(tmp_path / "windows"))
+
+    assert str(venv / "Scripts") not in entries
+    assert str(staged_python.parent.resolve()) in entries
