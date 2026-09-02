@@ -81,13 +81,35 @@ def test_apply_unix_policy_enforces_process_tree_only_when_session_established()
     assert with_session.cpu_limit == "unsupported"
 
 
-def test_unix_preexec_does_not_call_setsid(tmp_path):
-    import inspect
+def test_unix_preexec_does_not_call_setsid(monkeypatch, tmp_path):
+    calls: list = []
+    allow_paths = [tmp_path / "allow"]
+    policy = _policy()
 
-    source = inspect.getsource(unix_preexec)
-    assert "os.setsid" not in source
-    assert "setsid" not in source
-    unix_preexec(_policy(), tmp_path, [])()
+    monkeypatch.setattr(unixcontain, "_try_unshare_net", lambda: calls.append("unshare_net"))
+    monkeypatch.setattr(
+        unixcontain,
+        "_try_landlock",
+        lambda workdir, allow: calls.append(("landlock", workdir, allow)),
+    )
+    monkeypatch.setattr(
+        unixcontain,
+        "_try_rlimits",
+        lambda applied_policy: calls.append(("rlimits", applied_policy)),
+    )
+
+    def fail_setsid() -> None:
+        raise AssertionError("unix_preexec must not call os.setsid")
+
+    monkeypatch.setattr(unixcontain.os, "setsid", fail_setsid, raising=False)
+
+    unix_preexec(policy, tmp_path, allow_paths)()
+
+    assert calls == [
+        "unshare_net",
+        ("landlock", tmp_path, allow_paths),
+        ("rlimits", policy),
+    ]
 
 
 def test_spawn_unix_passes_start_new_session_true(monkeypatch, tmp_path):
