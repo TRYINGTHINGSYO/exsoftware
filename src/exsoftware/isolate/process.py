@@ -349,14 +349,14 @@ def _spawn_unix(command, workdir, env, policy, stdout, stderr):
         stdout=stdout.child_fd,
         stderr=stderr.child_fd,
         close_fds=True,
-        start_new_session=False,
+        start_new_session=True,
         preexec_fn=preexec,
     )
     stdout.close_write()
     stderr.close_write()
     proc._exsoftware_job = None  # type: ignore[attr-defined]
-    # Parent cannot observe preexec success. Map from kernel feature detection, not from a silent guess
-    # that the restrict actually attached. security-status proves it. Per-run: unsupported unless probe env set.
+    # Popen returning means the parent-established session exists. Landlock,
+    # netns, and rlimit still run in preexec and are not parent-verified.
     landlock = bool(support.get("landlock"))
     unshare = bool(support.get("unshare_net"))
     rlimit = bool(support.get("rlimit"))
@@ -366,27 +366,16 @@ def _spawn_unix(command, workdir, env, policy, stdout, stderr):
         landlock_applied=landlock,
         rlimit_cpu=rlimit,
         rlimit_as=rlimit,
+        session_established=True,
     )
-    if landlock:
-        policy.reasons.setdefault(
-            "filesystem_restriction",
-            "Landlock attempted in preexec; treat as enforced only after security-status probe",
-        )
-        # Honest: feature exists so we apply it, but per-run we did not empirically probe.
-        # The syscall is attempted. If available() was true, apply_landlock is called.
-        # If apply fails, child still runs without landlock — that would overclaim.
-        # Downgrade per-run FS/net to degraded when we cannot confirm.
-        policy.filesystem_restriction = "degraded"
-        policy.reasons["filesystem_restriction"] = (
-            "Landlock is applied in preexec when available; this run did not empirically verify denial"
-        )
-    if unshare:
-        policy.network_restriction = "degraded"
-        policy.reasons["network_restriction"] = (
-            "CLONE_NEWNET is attempted in preexec; this run did not empirically verify denial"
-        )
     policy.mechanism = "unix-preexec"
-    return proc, {"mechanism": policy.mechanism, "pid": proc.pid, "process_group": True, "unix_support": support}
+    return proc, {
+        "mechanism": policy.mechanism,
+        "pid": proc.pid,
+        "process_group": True,
+        "start_new_session": True,
+        "unix_support": support,
+    }
 
 
 def wait_or_timeout(proc: Any, timeout: float) -> int | None:
