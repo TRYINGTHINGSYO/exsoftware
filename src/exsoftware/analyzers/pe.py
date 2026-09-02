@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from ..models import Evidence, Finding
+from ..rules.pe_capabilities import normalize_dll_name, normalize_windows_api_name
 from ..rules.indicators import INTERESTING_APIS, INJECTION_SET, NETWORK_SET, PACKER_SECTION_NAMES
 from .base import Analyzer
 from .entropy import shannon_entropy
@@ -72,6 +74,27 @@ def _hex(value) -> str:
     return hex(_as_int(value))
 
 
+_EXECUTION_LEVEL_RE = re.compile(r"requestedExecutionLevel\b[^>]*\blevel\s*=\s*['\"]([^'\"]+)['\"]", re.I)
+
+
+def _entry_point_section(sections: list[dict], entry_rva: int) -> dict | None:
+    if not entry_rva:
+        return None
+    for section in sections:
+        start = int(section.get("virtual_address_rva") or 0)
+        size = max(int(section.get("virtual_size") or 0), int(section.get("raw_size") or 0))
+        if start <= entry_rva < start + size:
+            return {
+                "name": section.get("name"),
+                "virtual_address": section.get("virtual_address"),
+                "executable": bool(section.get("executable")),
+                "writable": bool(section.get("writable")),
+                "readable": bool(section.get("readable")),
+                "entropy": section.get("entropy"),
+            }
+    return None
+
+
 class PEAnalyzer(Analyzer):
     name = "pe"
     title = "Windows PE"
@@ -129,7 +152,7 @@ class PEAnalyzer(Analyzer):
         pe_format = "PE32+" if magic == 0x20B else "PE32" if magic == 0x10B else _hex(magic)
         timestamp = _as_int(fh.TimeDateStamp)
         image_base = _as_int(getattr(oh, "ImageBase", 0))
-        entry = _as_int(getattr(oh, "AddressOfEntryPoint", 0))
+        entry_rva = _as_int(getattr(oh, "AddressOfEntryPoint", 0))
 
         sections = []
         wx_sections = []
@@ -147,12 +170,14 @@ class PEAnalyzer(Analyzer):
             info = {
                 "name": name,
                 "virtual_address": _hex(section.VirtualAddress),
+                "virtual_address_rva": _as_int(section.VirtualAddress),
                 "virtual_size": virt_size,
                 "raw_size": raw_size,
                 "entropy": round(entropy, 4),
                 "executable": executable,
                 "writable": writable,
                 "readable": readable,
+                "characteristics": _hex(chars),
             }
             sections.append(info)
             if executable and writable:
@@ -161,33 +186,76 @@ class PEAnalyzer(Analyzer):
                 packer_sections.append(name)
 
         imports: list[dict] = []
+        imported_functions: list[dict] = []
         interesting_imports: list[dict] = []
         delayed = []
+        delayed_imports: list[dict] = []
         if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                dll = _decode_name(entry.dll) if entry.dll else "unknown"
+            for import_entry in pe.DIRECTORY_ENTRY_IMPORT:
+                dll = _decode_name(import_entry.dll) if import_entry.dll else "unknown"
+                normalized_dll = normalize_dll_name(dll)
                 functions = []
-                for imp in entry.imports:
+                for imp in import_entry.imports:
+                    ordinal = None
                     if imp.name:
                         fname = _decode_name(imp.name)
                     elif imp.ordinal:
+                        ordinal = _as_int(imp.ordinal)
                         fname = f"#{imp.ordinal}"
                     else:
                         fname = "unknown"
+                    normalized_name = normalize_windows_api_name(fname)
                     functions.append(fname)
-                    if fname in INTERESTING_APIS:
+                    imported_functions.append(
+                        {
+                            "dll": dll,
+                            "normalized_dll": normalized_dll,
+                            "name": fname,
+                            "normalized_name": normalized_name,
+                            "import_kind": "ordinal" if ordinal is not None else "name",
+                            "ordinal": ordinal,
+                        }
+                    )
+                    note = INTERESTING_APIS.get(fname) or (
+                        INTERESTING_APIS.get(normalized_name) if normalized_name else None
+                    )
+                    if note:
                         interesting_imports.append(
-                            {"dll": dll, "name": fname, "note": INTERESTING_APIS[fname]}
+                            {
+                                "dll": dll,
+                                "normalized_dll": normalized_dll,
+                                "name": fname,
+                                "normalized_name": normalized_name,
+                                "note": note,
+                            }
                         )
-                imports.append({"dll": dll, "count": len(functions), "functions": functions})
+                imports.append(
+                    {
+                        "dll": dll,
+                        "normalized_dll": normalized_dll,
+                        "count": len(functions),
+                        "functions": functions,
+                    }
+                )
         if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
-                delayed.append(_decode_name(entry.dll) if entry.dll else "unknown")
+            for delay_entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                dll = _decode_name(delay_entry.dll) if delay_entry.dll else "unknown"
+                delayed.append(dll)
+                delayed_imports.append({"dll": dll, "normalized_dll": normalize_dll_name(dll)})
 
         exports = []
+        export_features = []
         if hasattr(pe, "DIRECTORY_ENTRY_EXPORT") and pe.DIRECTORY_ENTRY_EXPORT:
             for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols[:400]:
-                exports.append(_decode_name(exp.name) if exp.name else f"#{exp.ordinal}")
+                name = _decode_name(exp.name) if exp.name else f"#{exp.ordinal}"
+                exports.append(name)
+                export_features.append(
+                    {
+                        "name": name,
+                        "normalized_name": normalize_windows_api_name(name),
+                        "ordinal": _as_int(getattr(exp, "ordinal", None), 0),
+                    }
+                )
 
         resources = []
         version_info = {}
@@ -202,6 +270,7 @@ class PEAnalyzer(Analyzer):
                         else:
                             count += 1
                 resources.append({"type": type_name, "count": max(count, 1)})
+        manifest = _manifest_info(pe)
         try:
             for fileinfo in getattr(pe, "FileInfo", []) or []:
                 for info in fileinfo:
@@ -217,9 +286,9 @@ class PEAnalyzer(Analyzer):
         if hasattr(pe, "DIRECTORY_ENTRY_DEBUG"):
             for debug in pe.DIRECTORY_ENTRY_DEBUG:
                 debug_types.append(_as_int(debug.struct.Type))
-                entry = getattr(debug, "entry", None)
-                if entry is not None and hasattr(entry, "PdbFileName"):
-                    pdb_paths.append(_decode_name(entry.PdbFileName))
+                debug_entry = getattr(debug, "entry", None)
+                if debug_entry is not None and hasattr(debug_entry, "PdbFileName"):
+                    pdb_paths.append(_decode_name(debug_entry.PdbFileName))
 
         clr_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[14] if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 14 else None
         is_dotnet = bool(clr_dir and _as_int(clr_dir.VirtualAddress) and _as_int(clr_dir.Size))
@@ -234,9 +303,11 @@ class PEAnalyzer(Analyzer):
         signed_blob = bool(security and _as_int(security.VirtualAddress) and _as_int(security.Size))
 
         tls_callbacks = 0
+        tls_callback_address = 0
         if hasattr(pe, "DIRECTORY_ENTRY_TLS") and pe.DIRECTORY_ENTRY_TLS:
             tls = pe.DIRECTORY_ENTRY_TLS.struct
             addr = _as_int(getattr(tls, "AddressOfCallBacks", 0))
+            tls_callback_address = addr
             tls_callbacks = 1 if addr else 0
 
         imphash = None
@@ -365,7 +436,12 @@ class PEAnalyzer(Analyzer):
                 )
             )
 
-        import_names = {item["name"] for item in interesting_imports}
+        import_names = {
+            str(value)
+            for item in imported_functions
+            for value in (item.get("name"), item.get("normalized_name"))
+            if value
+        }
         if len(imports) <= 2 and not is_dotnet and ctx.size > 20_000:
             findings.append(
                 Finding(
@@ -572,18 +648,27 @@ class PEAnalyzer(Analyzer):
             "timestamp": timestamp,
             "timestamp_iso": _ts(timestamp),
             "image_base": _hex(image_base),
-            "entry_point_rva": _hex(entry),
+            "entry_point_rva": _hex(entry_rva),
+            "entry_point_section": _entry_point_section(sections, entry_rva),
             "section_count": len(sections),
             "sections": sections,
+            "rwx_sections": wx_sections,
+            "high_entropy_executable_sections": high_entropy_exec,
+            "packer_section_names": packer_sections,
             "imports": imports,
+            "imported_functions": imported_functions,
             "delayed_imports": delayed,
+            "delayed_import_features": delayed_imports,
             "interesting_imports": interesting_imports,
             "exports": exports[:200],
+            "exported_functions": export_features[:200],
             "export_count": len(exports),
             "resources": resources,
+            "manifest": manifest,
             "version_info": version_info,
             "pdb_paths": pdb_paths,
             "debug_types": debug_types,
+            "debug_directory_present": bool(debug_types),
             "overlay_offset": overlay_offset,
             "overlay_size": overlay_size,
             "authenticode_directory": {
@@ -591,10 +676,58 @@ class PEAnalyzer(Analyzer):
                 "size": _as_int(security.Size) if security else 0,
             },
             "tls_callbacks_present": bool(tls_callbacks),
+            "tls_callback_count": tls_callbacks,
+            "tls_callback_address": _hex(tls_callback_address),
             "imphash": imphash,
             "capabilities": capabilities,
         }
         return self.result(details=details, findings=findings)
+
+
+def _manifest_info(pe) -> dict:
+    info = {"present": False, "requested_execution_level": None}
+    if not hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+        return info
+    try:
+        for etype in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+            type_name = pefile_type_name(etype)
+            if type_name != "MANIFEST" and _as_int(getattr(etype, "id", None), 0) != 24:
+                continue
+            for data_entry in _resource_data_entries(etype):
+                data = pe.get_data(
+                    _as_int(data_entry.OffsetToData),
+                    min(_as_int(data_entry.Size), 64 * 1024),
+                )
+                text = _decode_manifest(data)
+                match = _EXECUTION_LEVEL_RE.search(text)
+                info["present"] = True
+                if match:
+                    info["requested_execution_level"] = match.group(1)
+                    return info
+    except Exception:
+        return info
+    return info
+
+
+def _resource_data_entries(entry) -> list:
+    out = []
+    directory = getattr(entry, "directory", None)
+    if not directory:
+        data = getattr(entry, "data", None)
+        struct = getattr(data, "struct", None)
+        return [struct] if struct is not None else []
+    for child in getattr(directory, "entries", []) or []:
+        out.extend(_resource_data_entries(child))
+    return out
+
+
+def _decode_manifest(data: bytes) -> str:
+    for encoding in ("utf-8", "utf-16le", "latin-1"):
+        try:
+            return data.decode(encoding, "ignore")
+        except Exception:
+            continue
+    return ""
 
 
 def pefile_type_name(entry) -> str:

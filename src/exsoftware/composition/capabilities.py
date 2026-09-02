@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
 from ..models import Report
+from ..rules.pe_capabilities import (
+    PE_CAPABILITY_RULES,
+    PECapabilityRule,
+    normalize_dll_name,
+    normalize_windows_api_name,
+)
 from .dependencies import named_value
 from .model import graph_ref
 
@@ -22,6 +30,8 @@ class CapHit:
     artifact_id: str
     explanation: str
     refs: dict
+    evidence: tuple[str, ...] = ()
+    confidence: str = "medium"
 
 
 def _dlls(report: Report, artifact_id: str) -> dict[str, object]:
@@ -111,15 +121,34 @@ def infer_capabilities(report: Report) -> list[dict]:
                 "statement": hit.statement,
                 "not_established": hit.not_established,
                 "certainty": hit.certainty,
+                "confidence": hit.confidence,
                 "artifact_id": hit.artifact_id,
                 "explanation": hit.explanation,
+                "evidence": list(hit.evidence),
                 "refs": refs,
             }
         )
     family_order = {
-        "NETWORK": 0, "PROCESS": 1, "SHELL": 2, "SCRIPT_EXECUTION": 3,
-        "DYNAMIC_LOADING": 4, "REGISTRY": 5, "CRYPTOGRAPHY": 6, "FILESYSTEM": 7,
-        "UI": 8, "SYSTEM_INFORMATION": 9, "ARCHIVE": 10, "DATABASE": 11,
+        "PROCESS": 0,
+        "SHELL": 1,
+        "PROCESS_INJECTION": 2,
+        "MEMORY": 3,
+        "NETWORK": 4,
+        "FILESYSTEM": 5,
+        "REGISTRY": 6,
+        "PERSISTENCE": 7,
+        "PRIVILEGE": 8,
+        "SECURITY": 9,
+        "CRYPTOGRAPHY": 10,
+        "ANTI_ANALYSIS": 11,
+        "TIMING": 12,
+        "SYSTEM_DISCOVERY": 13,
+        "UI": 14,
+        "SENSITIVE_DATA": 15,
+        "SCRIPT_EXECUTION": 16,
+        "DYNAMIC_LOADING": 17,
+        "ARCHIVE": 18,
+        "DATABASE": 19,
     }
     out.sort(key=lambda item: (family_order.get(item["family"], 50), item["id"], item["artifact_id"]))
     return out
@@ -127,134 +156,236 @@ def infer_capabilities(report: Report) -> list[dict]:
 
 def _pe_caps(report: Report, aid: str, dlls: dict, fns: set[str]) -> list[CapHit]:
     hits: list[CapHit] = []
-
-    def dll_hit(dll: str, rule_id: str, family: str, title: str, statement: str) -> None:
-        rel = dlls.get(dll)
-        if rel is None:
-            return
+    index = _pe_index(report, aid, dlls)
+    if not index["imports"] and fns:
+        index = _legacy_pe_index(aid, dlls, fns)
+    for rule in PE_CAPABILITY_RULES:
+        if not _rule_matches(rule, index):
+            continue
+        refs, evidence = _rule_refs(aid, rule, index)
         hits.append(
             CapHit(
-                rule_id=rule_id,
-                family=family,
-                title=title,
-                statement=statement,
-                not_established=BEHAVIOR_NOT,
-                certainty="derived",
-                artifact_id=aid,
-                explanation=f"PE import table lists {dll}.",
-                refs=_rel_ref(report, aid, rel),
-            )
-        )
-
-    dll_hit("winhttp.dll", "CAP.NETWORK.PE_WINHTTP.001", "NETWORK", "WinHTTP APIs referenced", "References WinHTTP networking APIs.")
-    dll_hit("wininet.dll", "CAP.NETWORK.PE_WININET.001", "NETWORK", "WinINet APIs referenced", "References WinINet networking APIs.")
-    dll_hit("ws2_32.dll", "CAP.NETWORK.PE_WS2.001", "NETWORK", "Windows Sockets APIs referenced", "References Windows Sockets (Winsock) APIs.")
-    dll_hit("wsock32.dll", "CAP.NETWORK.PE_WSOCK.001", "NETWORK", "Windows Sockets APIs referenced", "References Windows Sockets (Winsock) APIs.")
-    dll_hit("urlmon.dll", "CAP.NETWORK.PE_URLMON.001", "NETWORK", "URLMON APIs referenced", "References URLMON networking APIs.")
-    dll_hit("bcrypt.dll", "CAP.CRYPTOGRAPHY.PE_BCRYPT.001", "CRYPTOGRAPHY", "BCrypt APIs referenced", "References Windows BCrypt cryptography APIs.")
-    dll_hit("crypt32.dll", "CAP.CRYPTOGRAPHY.PE_CRYPT32.001", "CRYPTOGRAPHY", "Crypt32 APIs referenced", "References Windows Crypt32 APIs.")
-    dll_hit("advapi32.dll", "CAP.REGISTRY.PE_ADVAPI.001", "REGISTRY", "Advapi32 APIs referenced", "References Advapi32, which includes registry and service APIs.")
-    dll_hit("user32.dll", "CAP.UI.PE_USER32.001", "UI", "User32 APIs referenced", "References User32 windowing/UI APIs.")
-
-    if fns & {"CreateProcessA", "CreateProcessW", "WinExec"}:
-        hits.append(
-            CapHit(
-                "CAP.PROCESS.PE_CREATEPROCESS.001",
-                "PROCESS",
-                "Process-creation APIs referenced",
-                "References APIs that can start a new process.",
+                rule.id,
+                rule.family,
+                rule.title,
+                rule.statement,
                 BEHAVIOR_NOT,
-                "derived",
+                rule.certainty,
                 aid,
-                "PE imports include CreateProcess or WinExec.",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"ShellExecuteA", "ShellExecuteW", "ShellExecuteExA", "ShellExecuteExW"}:
-        hits.append(
-            CapHit(
-                "CAP.SHELL.PE_SHELLEXECUTE.001",
-                "SHELL",
-                "ShellExecute APIs referenced",
-                "References ShellExecute, which can run a program or open a document.",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE imports include ShellExecute.",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "GetProcAddress"}:
-        hits.append(
-            CapHit(
-                "CAP.DYNAMIC_LOADING.PE_LOADLIBRARY.001",
-                "DYNAMIC_LOADING",
-                "Dynamic library loading APIs referenced",
-                "References LoadLibrary/GetProcAddress, which can load code at runtime.",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE imports include LoadLibrary and/or GetProcAddress.",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"RegSetValueExA", "RegSetValueExW", "RegCreateKeyExA", "RegCreateKeyExW"}:
-        hits.append(
-            CapHit(
-                "CAP.REGISTRY.PE_REGWRITE.001",
-                "REGISTRY",
-                "Registry-write APIs referenced",
-                "References APIs that can create or write registry values.",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE imports include RegSetValueEx or RegCreateKeyEx.",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"CryptEncrypt", "CryptDecrypt", "BCryptEncrypt", "BCryptDecrypt"}:
-        hits.append(
-            CapHit(
-                "CAP.CRYPTOGRAPHY.PE_ENCRYPT.001",
-                "CRYPTOGRAPHY",
-                "Encryption APIs referenced",
-                "References APIs that can encrypt or decrypt data.",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE imports include CryptEncrypt/BCryptEncrypt (or decrypt equivalents).",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"CreateFileA", "CreateFileW", "WriteFile", "DeleteFileA", "DeleteFileW"}:
-        hits.append(
-            CapHit(
-                "CAP.FILESYSTEM.PE_CREATEFILE.001",
-                "FILESYSTEM",
-                "Filesystem APIs referenced",
-                "References APIs that can create, write, or delete files.",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE imports include CreateFile/WriteFile/DeleteFile.",
-                graph_ref(artifact_ids=[aid]),
-            )
-        )
-    if fns & {"WinHttpOpen", "WinHttpConnect", "InternetOpenA", "InternetOpenW", "WSAStartup", "URLDownloadToFileA", "URLDownloadToFileW"}:
-        hits.append(
-            CapHit(
-                "CAP.NETWORK.PE_API.001",
-                "NETWORK",
-                "Networking APIs referenced",
-                "References networking APIs (WinHTTP, WinINet, Winsock, or URLDownload).",
-                BEHAVIOR_NOT,
-                "derived",
-                aid,
-                "PE interesting-import set includes networking APIs.",
-                graph_ref(artifact_ids=[aid]),
+                rule.explanation,
+                refs,
+                tuple(evidence),
+                rule.confidence,
             )
         )
     return hits
+
+
+def _pe_index(report: Report, aid: str, dlls: dict) -> dict[str, Any]:
+    imports: dict[str, list[dict[str, Any]]] = {}
+    dll_refs: dict[str, list[Any]] = {}
+    registry_strings: list[dict[str, Any]] = []
+    seen_imports: set[tuple[str, str, str]] = set()
+
+    for dll, rel in dlls.items():
+        dll_refs.setdefault(normalize_dll_name(dll), []).append(rel)
+    for obs in report.observations:
+        if obs.artifact_id != aid or obs.kind != "pe.import.function":
+            continue
+        data = obs.data or {}
+        raw_name = str(data.get("name") or "unknown")
+        normalized_name = data.get("normalized_name") or normalize_windows_api_name(raw_name)
+        dll = str(data.get("dll") or "unknown")
+        normalized_dll = normalize_dll_name(str(data.get("normalized_dll") or dll))
+        key = (normalized_dll, raw_name, str(data.get("ordinal")))
+        if key in seen_imports:
+            continue
+        seen_imports.add(key)
+        hit = {
+            "name": raw_name,
+            "normalized_name": normalized_name,
+            "dll": dll,
+            "normalized_dll": normalized_dll,
+            "evidence_ids": list(obs.evidence_ids or []),
+            "observation_ids": [obs.id],
+            "relationship_ids": [rel.id for rel in dll_refs.get(normalized_dll, []) if getattr(rel, "id", None)],
+            "label": f"{dll}!{raw_name}",
+        }
+        if normalized_name:
+            imports.setdefault(normalized_name, []).append(hit)
+        dll_refs.setdefault(normalized_dll, [])
+
+    # Backward-compatible fallback for reports produced before pe.import.function observations.
+    for run in report.analyzer_runs:
+        if run.analyzer_id != "pe" or run.artifact_id != aid or run.status != "completed":
+            continue
+        for item in _pe_import_features(run.details or {}):
+            raw_name = str(item.get("name") or "unknown")
+            normalized_name = item.get("normalized_name") or normalize_windows_api_name(raw_name)
+            if not normalized_name:
+                continue
+            dll = str(item.get("dll") or "unknown")
+            normalized_dll = normalize_dll_name(str(item.get("normalized_dll") or dll))
+            key = (normalized_dll, raw_name, str(item.get("ordinal")))
+            if key in seen_imports:
+                continue
+            seen_imports.add(key)
+            imports.setdefault(normalized_name, []).append(
+                {
+                    "name": raw_name,
+                    "normalized_name": normalized_name,
+                    "dll": dll,
+                    "normalized_dll": normalized_dll,
+                    "evidence_ids": [],
+                    "observation_ids": [],
+                    "relationship_ids": [rel.id for rel in dll_refs.get(normalized_dll, []) if getattr(rel, "id", None)],
+                    "label": f"{dll}!{raw_name}",
+                }
+            )
+
+    for finding in report.findings:
+        if finding.artifact_id != aid:
+            continue
+        if finding.legacy_id != "strings.registry" and finding.rule_id != "STR.REGISTRY.001":
+            continue
+        for ev in finding.evidence:
+            value = ev.value or ""
+            if not value:
+                continue
+            registry_strings.append(
+                {
+                    "value": value,
+                    "evidence_ids": [ev.id] if ev.id else [],
+                    "finding_ids": [finding.id] if finding.id else [],
+                    "label": value,
+                }
+            )
+    return {"imports": imports, "dll_refs": dll_refs, "registry_strings": registry_strings}
+
+
+def _legacy_pe_index(aid: str, dlls: dict, fns: set[str]) -> dict[str, Any]:
+    imports: dict[str, list[dict[str, Any]]] = {}
+    dll_refs = {normalize_dll_name(dll): [rel] for dll, rel in dlls.items()}
+    for fn in fns:
+        normalized = normalize_windows_api_name(fn)
+        if not normalized:
+            continue
+        imports.setdefault(normalized, []).append(
+            {
+                "name": fn,
+                "normalized_name": normalized,
+                "dll": "unknown",
+                "normalized_dll": "unknown",
+                "evidence_ids": [],
+                "observation_ids": [],
+                "relationship_ids": [],
+                "label": fn,
+            }
+        )
+    return {"imports": imports, "dll_refs": dll_refs, "registry_strings": []}
+
+
+def _pe_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
+    features = details.get("imported_functions")
+    if isinstance(features, list):
+        return [item for item in features if isinstance(item, dict)]
+    out: list[dict[str, Any]] = []
+    for item in details.get("imports") or []:
+        if not isinstance(item, dict):
+            continue
+        dll = item.get("dll") or "unknown"
+        normalized_dll = item.get("normalized_dll") or normalize_dll_name(str(dll))
+        for fn in item.get("functions") or []:
+            raw = fn.get("name") if isinstance(fn, dict) else str(fn)
+            out.append(
+                {
+                    "dll": dll,
+                    "normalized_dll": normalized_dll,
+                    "name": raw,
+                    "normalized_name": (fn.get("normalized_name") if isinstance(fn, dict) else None)
+                    or normalize_windows_api_name(raw),
+                    "import_kind": fn.get("import_kind") if isinstance(fn, dict) else ("ordinal" if str(raw).startswith("#") else "name"),
+                    "ordinal": fn.get("ordinal") if isinstance(fn, dict) else None,
+                }
+            )
+    return out
+
+
+def _rule_matches(rule: PECapabilityRule, index: dict[str, Any]) -> bool:
+    imports = index["imports"]
+    dll_refs = index["dll_refs"]
+    allowed_import_dlls = _rule_import_dlls(rule)
+    if rule.imports_all and not all(_import_hits(imports, name, allowed_import_dlls) for name in rule.imports_all):
+        return False
+    if rule.imports_any and not any(_import_hits(imports, name, allowed_import_dlls) for name in rule.imports_any):
+        return False
+    if rule.dlls_all and not all(normalize_dll_name(name) in dll_refs for name in rule.dlls_all):
+        return False
+    if rule.dlls_any and not any(normalize_dll_name(name) in dll_refs for name in rule.dlls_any):
+        return False
+    if rule.registry_path_contains:
+        values = [str(item.get("value") or "").lower().replace("/", "\\") for item in index["registry_strings"]]
+        if not any(all(fragment in value for fragment in rule.registry_path_contains) for value in values):
+            return False
+    return True
+
+
+def _rule_import_dlls(rule: PECapabilityRule) -> set[str]:
+    if not (rule.imports_any or rule.imports_all):
+        return set()
+    return {normalize_dll_name(name) for name in (*rule.dlls_all, *rule.dlls_any)}
+
+
+def _import_hits(imports: dict[str, list[dict[str, Any]]], name: str, allowed_dlls: set[str]) -> list[dict[str, Any]]:
+    hits = imports.get(name) or []
+    if not allowed_dlls:
+        return hits
+    return [hit for hit in hits if normalize_dll_name(str(hit.get("normalized_dll") or hit.get("dll") or "")) in allowed_dlls]
+
+
+def _rule_refs(aid: str, rule: PECapabilityRule, index: dict[str, Any]) -> tuple[dict, list[str]]:
+    evidence_ids: list[str] = []
+    observation_ids: list[str] = []
+    relationship_ids: list[str] = []
+    finding_ids: list[str] = []
+    labels: list[str] = []
+    allowed_import_dlls = _rule_import_dlls(rule)
+
+    wanted = [*rule.imports_all]
+    if rule.imports_any:
+        wanted.extend(name for name in rule.imports_any if _import_hits(index["imports"], name, allowed_import_dlls))
+    for name in dict.fromkeys(wanted):
+        matches = _import_hits(index["imports"], name, allowed_import_dlls)
+        for hit in matches[:4]:
+            evidence_ids.extend(hit.get("evidence_ids") or [])
+            observation_ids.extend(hit.get("observation_ids") or [])
+            relationship_ids.extend(hit.get("relationship_ids") or [])
+            labels.append(hit.get("label") or hit.get("name") or name)
+
+    for dll in [*rule.dlls_all, *rule.dlls_any]:
+        for rel in index["dll_refs"].get(normalize_dll_name(dll), []):
+            if getattr(rel, "id", None):
+                relationship_ids.append(rel.id)
+            evidence_ids.extend(getattr(rel, "evidence_ids", None) or [])
+            labels.append(normalize_dll_name(dll))
+
+    if rule.registry_path_contains:
+        for item in index["registry_strings"]:
+            value = str(item.get("value") or "").lower().replace("/", "\\")
+            if all(fragment in value for fragment in rule.registry_path_contains):
+                evidence_ids.extend(item.get("evidence_ids") or [])
+                finding_ids.extend(item.get("finding_ids") or [])
+                labels.append(item.get("label") or value)
+
+    refs = graph_ref(
+        artifact_ids=[aid],
+        observation_ids=list(dict.fromkeys(observation_ids)),
+        evidence_ids=list(dict.fromkeys(evidence_ids)),
+        relationship_ids=list(dict.fromkeys(relationship_ids)),
+        finding_ids=list(dict.fromkeys(finding_ids)),
+        rule_ids=[rule.id],
+    )
+    return refs, list(dict.fromkeys(labels))[:12]
 
 
 def _python_caps(report: Report, aid: str, py: dict) -> list[CapHit]:

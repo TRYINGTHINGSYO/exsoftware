@@ -471,6 +471,95 @@ class Investigation:
                     extra={"kind": "pdb"},
                     run_id=run_id,
                 )
+            for item in _pe_import_features(details):
+                raw_name = item.get("name") or "unknown"
+                dll = item.get("dll") or "unknown"
+                normalized_name = item.get("normalized_name")
+                normalized_dll = item.get("normalized_dll")
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="pe-import-function",
+                    summary=f"PE import {dll}!{raw_name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    location=f"import {dll}",
+                    value=raw_name,
+                    extra={
+                        "dll": dll,
+                        "normalized_dll": normalized_dll,
+                        "normalized_name": normalized_name,
+                        "import_kind": item.get("import_kind") or "name",
+                        "ordinal": item.get("ordinal"),
+                    },
+                    run_id=run_id,
+                )
+                self.add_observation(
+                    artifact_id=artifact_id,
+                    kind="pe.import.function",
+                    statement=f"PE imports {dll}!{raw_name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    data={
+                        "dll": dll,
+                        "normalized_dll": normalized_dll,
+                        "name": raw_name,
+                        "normalized_name": normalized_name,
+                        "import_kind": item.get("import_kind") or "name",
+                        "ordinal": item.get("ordinal"),
+                    },
+                    run_id=run_id,
+                )
+            for item in details.get("exported_functions") or []:
+                raw_name = item.get("name") if isinstance(item, dict) else str(item)
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="pe-export-function",
+                    summary=f"PE export {raw_name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    value=raw_name,
+                    extra={
+                        "normalized_name": item.get("normalized_name") if isinstance(item, dict) else None,
+                        "ordinal": item.get("ordinal") if isinstance(item, dict) else None,
+                    },
+                    run_id=run_id,
+                )
+                self.add_observation(
+                    artifact_id=artifact_id,
+                    kind="pe.export.function",
+                    statement=f"PE exports {raw_name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    data=dict(item) if isinstance(item, dict) else {"name": raw_name},
+                    run_id=run_id,
+                )
+            manifest = details.get("manifest") or {}
+            if manifest.get("present"):
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="pe-manifest",
+                    summary="PE manifest present",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    value=str(manifest.get("requested_execution_level") or "requestedExecutionLevel unknown"),
+                    extra=dict(manifest),
+                    run_id=run_id,
+                )
+                self.add_observation(
+                    artifact_id=artifact_id,
+                    kind="pe.manifest",
+                    statement="PE manifest is present",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    data=dict(manifest),
+                    run_id=run_id,
+                )
         elif analyzer_id == "strings":
             for item in details.get("urls") or []:
                 url = item.get("url") if isinstance(item, dict) else str(item)
@@ -597,3 +686,37 @@ class Investigation:
 
     def get(self, artifact_id: str) -> Artifact | None:
         return self.artifacts.get(artifact_id)
+
+
+def _pe_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
+    features = details.get("imported_functions")
+    if isinstance(features, list):
+        return [item for item in features if isinstance(item, dict)]
+    out: list[dict[str, Any]] = []
+    for item in details.get("imports") or []:
+        if not isinstance(item, dict):
+            continue
+        dll = item.get("dll") or "unknown"
+        normalized_dll = item.get("normalized_dll")
+        for fn in item.get("functions") or []:
+            if isinstance(fn, dict):
+                raw = fn.get("name") or "unknown"
+                normalized_name = fn.get("normalized_name")
+                import_kind = fn.get("import_kind") or ("ordinal" if str(raw).startswith("#") else "name")
+                ordinal = fn.get("ordinal")
+            else:
+                raw = str(fn)
+                normalized_name = None
+                import_kind = "ordinal" if raw.startswith("#") else "name"
+                ordinal = int(raw[1:]) if raw.startswith("#") and raw[1:].isdigit() else None
+            out.append(
+                {
+                    "dll": dll,
+                    "normalized_dll": normalized_dll,
+                    "name": raw,
+                    "normalized_name": normalized_name,
+                    "import_kind": import_kind,
+                    "ordinal": ordinal,
+                }
+            )
+    return out
