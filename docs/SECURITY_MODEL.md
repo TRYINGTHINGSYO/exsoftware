@@ -138,6 +138,6 @@ Fallback if AppContainer launch fails: restricted token + Low integrity (needs `
 
 ## Unix-family
 
-Landlock + `CLONE_NEWNET` + rlimits are attempted in `preexec_fn` when the kernel supports them. Per-run filesystem/network are **degraded** unless a probe confirms denial, because the parent cannot observe whether preexec succeeded.
+The parent creates the worker in a new session (`subprocess.Popen(..., start_new_session=True)`). That parent-visible session is what makes `process_tree_limit=enforced` and lets timeout use `killpg`. Landlock, `CLONE_NEWNET`, and rlimits are still attempted in `preexec_fn` when the kernel supports them, but those child-side applies are not parent-verified. Per-run filesystem, network, memory, and CPU claims stay **degraded** (or **unsupported** if the feature is absent) unless a probe confirms denial. A swallowed `setsid()` in preexec is not used as evidence.
 
 See [ISOLATE_PROTOCOL.md](ISOLATE_PROTOCOL.md).

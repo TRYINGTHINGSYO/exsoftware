@@ -11,17 +11,15 @@ from .policy import IsolationPolicy
 
 
 def unix_preexec(policy: IsolationPolicy, workdir: Path, allow_paths: list[Path]) -> Callable[[], None]:
-    """Return a preexec_fn. Failures are recorded on *policy* after spawn via reasons set here.
+    """Return a preexec_fn that attempts Landlock, netns, and rlimits.
 
-    preexec cannot talk to the parent except by surviving. We set env EXSOFTWARE_UNIX_NET
-    from the parent based on a probe, and apply landlock/unshare best-effort.
+    The parent establishes the session with ``start_new_session=True``. This
+    hook must not attempt to create the session itself. Child-side apply
+    failures are invisible to the parent; callers must not report those
+    protections as enforced from feature detection alone.
     """
 
     def _preexec() -> None:
-        try:
-            os.setsid()
-        except OSError:
-            pass
         _try_unshare_net()
         _try_landlock(workdir, allow_paths)
         _try_rlimits(policy)
@@ -106,19 +104,43 @@ def describe_unix_support() -> dict[str, Any]:
     return info
 
 
-def apply_unix_policy(policy: IsolationPolicy, *, unshare_applied: bool, landlock_applied: bool, rlimit_cpu: bool, rlimit_as: bool) -> None:
-    policy.process_tree_limit = "enforced"
-    policy.reasons["process_tree_limit"] = "Child started in a new session; timeout uses killpg"
+def apply_unix_policy(
+    policy: IsolationPolicy,
+    *,
+    unshare_applied: bool,
+    landlock_applied: bool,
+    rlimit_cpu: bool,
+    rlimit_as: bool,
+    session_established: bool = False,
+) -> None:
+    """Map Unix launch evidence onto capabilities.
+
+    ``landlock_applied`` / ``unshare_applied`` / rlimit flags mean the parent
+    *attempted* those child-side applies (usually because the feature exists).
+    They are not proof the restriction attached. Only ``session_established``
+    is parent-visible (``Popen(start_new_session=True)`` succeeded).
+    """
+    if session_established:
+        policy.process_tree_limit = "enforced"
+        policy.reasons["process_tree_limit"] = (
+            "Parent created a new session (start_new_session=True); timeout uses killpg"
+        )
     if policy.max_processes <= 1 and sys.platform == "linux":
         policy.process_creation = "degraded"
-        policy.reasons["process_creation"] = "RLIMIT_NPROC may deny extra processes; descendants are still killed on timeout"
+        policy.reasons["process_creation"] = (
+            "RLIMIT_NPROC may deny extra processes; descendants are still killed on timeout"
+        )
     else:
         policy.process_creation = "degraded"
-        policy.reasons["process_creation"] = "Process creation is not fully prevented; descendants are killed on timeout"
+        policy.reasons["process_creation"] = (
+            "Process creation is not fully prevented; descendants are killed on timeout"
+        )
     if landlock_applied:
-        policy.filesystem_restriction = "enforced"
+        policy.filesystem_restriction = "degraded"
         policy.mechanism = "landlock" if not unshare_applied else "landlock+netns"
-        policy.reasons["filesystem_restriction"] = "Landlock ruleset allows workdir + runtime paths only"
+        policy.reasons["filesystem_restriction"] = (
+            "Landlock is attempted in preexec when available; this run did not empirically verify denial"
+        )
     elif sys.platform == "linux":
         policy.filesystem_restriction = "unsupported"
         policy.reasons["filesystem_restriction"] = "Landlock is not available or failed to apply"
@@ -126,17 +148,37 @@ def apply_unix_policy(policy: IsolationPolicy, *, unshare_applied: bool, landloc
         policy.filesystem_restriction = "unsupported"
         policy.reasons["filesystem_restriction"] = f"{sys.platform} has no Landlock equivalent in this build"
     if unshare_applied:
-        policy.network_restriction = "enforced"
-        policy.reasons["network_restriction"] = "CLONE_NEWNET user namespace: empty network namespace"
+        policy.network_restriction = "degraded"
+        policy.reasons["network_restriction"] = (
+            "CLONE_NEWNET is attempted in preexec; this run did not empirically verify denial"
+        )
         if policy.mechanism == "none":
             policy.mechanism = "netns"
     elif sys.platform == "linux":
         policy.network_restriction = "unsupported"
-        policy.reasons["network_restriction"] = "unshare(CLONE_NEWNET) is not available (often needs user namespaces)"
+        policy.reasons["network_restriction"] = (
+            "unshare(CLONE_NEWNET) is not available (often needs user namespaces)"
+        )
     else:
         policy.network_restriction = "unsupported"
-        policy.reasons["network_restriction"] = f"{sys.platform} network namespace isolation is not implemented"
-    policy.memory_limit = "enforced" if rlimit_as else "unsupported"
-    policy.cpu_limit = "enforced" if rlimit_cpu else "unsupported"
+        policy.reasons["network_restriction"] = (
+            f"{sys.platform} network namespace isolation is not implemented"
+        )
+    if rlimit_as:
+        policy.memory_limit = "degraded"
+        policy.reasons["memory_limit"] = (
+            "RLIMIT_AS is attempted in preexec; this run did not parent-verify the limit attached"
+        )
+    else:
+        policy.memory_limit = "unsupported"
+        policy.reasons["memory_limit"] = "RLIMIT_AS is not available on this interpreter"
+    if rlimit_cpu:
+        policy.cpu_limit = "degraded"
+        policy.reasons["cpu_limit"] = (
+            "RLIMIT_CPU is attempted in preexec; this run did not parent-verify the limit attached"
+        )
+    else:
+        policy.cpu_limit = "unsupported"
+        policy.reasons["cpu_limit"] = "RLIMIT_CPU is not available on this interpreter"
     if policy.mechanism == "none":
         policy.mechanism = "process-group"
