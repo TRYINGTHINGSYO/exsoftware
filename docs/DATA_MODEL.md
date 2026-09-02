@@ -110,6 +110,8 @@ These values are stored on findings, observations, and relationships. They are n
 **Inferred:** the program may perform HTTP networking.  
 **Not allowed as fact:** the program contacts example.com at runtime, merely because that string exists.
 
+PE capability inference uses normalized observations derived from the isolated PE analyzer's import table. Raw DLL/function names remain in evidence (for example `kernel32.dll!CreateProcessW`), while matching can normalize ANSI/Unicode suffixes to one semantic primitive (`CreateProcess`). Unknown ordinal imports are preserved as evidence but do not match named capability rules.
+
 ## Analyzer provenance
 
 Every analyzer class has a stable `name` and `version` (currently `1.0.0`). Every `analyzer_runs[]` row records:
@@ -137,7 +139,7 @@ The pipeline will:
 - select analyzers from the declarative registry (`detected_types` / `detected_families` on `AnalyzerSpec`; trusted parent, no analyzer methods, no implementation imports)
 - record the run (including unsupported/failed/timeout/terminated)
 - lift findings into the graph with evidence + observed backing observations
-- emit relationships from well-known `details` keys (`imports`, `urls`, `needed`, `certificates`, …)
+- emit relationships and observations from well-known `details` keys (`imports`, normalized PE imported functions, `urls`, `needed`, `certificates`, …)
 
 Do not execute the sample. Do not fetch extracted URLs.
 

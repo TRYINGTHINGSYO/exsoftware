@@ -65,6 +65,12 @@ def render_text(report: Report, composition: CompositionReport | dict | None = N
         for cap in caps:
             lines.append(f"* {cap['title']}")
             lines.append(f"    {cap['statement']}")
+            evidence = cap.get("evidence") or []
+            if evidence:
+                lines.append(f"    Evidence: {', '.join(str(item) for item in evidence[:8])}")
+            confidence = cap.get("confidence")
+            if confidence:
+                lines.append(f"    Confidence: {confidence}")
             lines.append(f"    Not established: {cap['not_established']}")
     important = comp.get("important_observations") or []
     lines += ["", "Important observations", "----------------------"]

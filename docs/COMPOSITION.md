@@ -48,6 +48,17 @@ Embed the derived view on the same report rather than a second endpoint. One ana
 ```
 
 Every capability and important observation carries `refs` back into the graph.
+Capability entries may also include human-readable `evidence` labels and a
+`confidence` value. Those are additive conveniences; the canonical provenance is
+still the `refs` object pointing at artifacts, observations, evidence,
+relationships, findings, and rule IDs.
+
+PE capabilities are inferred from normalized import observations emitted by the
+isolated PE analyzer, optionally corroborated by existing string findings. They
+can miss statically linked implementations, dynamically resolved APIs,
+obfuscated imports, runtime-decoded functionality, and behavior implemented
+without recognizable APIs. No capability match means "not observed by these
+static rules", not "absent".
 
 ## Completeness states
 

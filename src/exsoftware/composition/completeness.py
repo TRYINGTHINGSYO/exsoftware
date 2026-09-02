@@ -108,6 +108,27 @@ def build_completeness(report: Report) -> tuple[dict, list[dict]]:
                 "refs": graph_ref(finding_ids=[item.id for item in unsigned if item.id], rule_ids=["SIG.ABSENT.001"]),
             }
         )
+    if any(run.analyzer_id == "pe" and run.status == "completed" for run in report.analyzer_runs):
+        gaps.append(
+            {
+                "id": "GAP.PE.CAPABILITIES.IMPORTS_ONLY.001",
+                "kind": "import_based_capabilities",
+                "statement": (
+                    "PE capability inference is based on static imports and visible strings. "
+                    "Statically linked code, dynamically resolved APIs, obfuscated imports, "
+                    "runtime-decoded functionality, and behavior without recognizable APIs may be missed."
+                ),
+                "refs": graph_ref(
+                    artifact_ids=list(
+                        dict.fromkeys(
+                            run.artifact_id
+                            for run in report.analyzer_runs
+                            if run.analyzer_id == "pe" and run.status == "completed"
+                        )
+                    )
+                ),
+            }
+        )
     if encrypted_n:
         gaps.append(
             {
