@@ -152,7 +152,7 @@ class PEAnalyzer(Analyzer):
         pe_format = "PE32+" if magic == 0x20B else "PE32" if magic == 0x10B else _hex(magic)
         timestamp = _as_int(fh.TimeDateStamp)
         image_base = _as_int(getattr(oh, "ImageBase", 0))
-        entry = _as_int(getattr(oh, "AddressOfEntryPoint", 0))
+        entry_rva = _as_int(getattr(oh, "AddressOfEntryPoint", 0))
 
         sections = []
         wx_sections = []
@@ -191,11 +191,11 @@ class PEAnalyzer(Analyzer):
         delayed = []
         delayed_imports: list[dict] = []
         if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                dll = _decode_name(entry.dll) if entry.dll else "unknown"
+            for import_entry in pe.DIRECTORY_ENTRY_IMPORT:
+                dll = _decode_name(import_entry.dll) if import_entry.dll else "unknown"
                 normalized_dll = normalize_dll_name(dll)
                 functions = []
-                for imp in entry.imports:
+                for imp in import_entry.imports:
                     ordinal = None
                     if imp.name:
                         fname = _decode_name(imp.name)
@@ -238,8 +238,8 @@ class PEAnalyzer(Analyzer):
                     }
                 )
         if hasattr(pe, "DIRECTORY_ENTRY_DELAY_IMPORT"):
-            for entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
-                dll = _decode_name(entry.dll) if entry.dll else "unknown"
+            for delay_entry in pe.DIRECTORY_ENTRY_DELAY_IMPORT:
+                dll = _decode_name(delay_entry.dll) if delay_entry.dll else "unknown"
                 delayed.append(dll)
                 delayed_imports.append({"dll": dll, "normalized_dll": normalize_dll_name(dll)})
 
@@ -286,9 +286,9 @@ class PEAnalyzer(Analyzer):
         if hasattr(pe, "DIRECTORY_ENTRY_DEBUG"):
             for debug in pe.DIRECTORY_ENTRY_DEBUG:
                 debug_types.append(_as_int(debug.struct.Type))
-                entry = getattr(debug, "entry", None)
-                if entry is not None and hasattr(entry, "PdbFileName"):
-                    pdb_paths.append(_decode_name(entry.PdbFileName))
+                debug_entry = getattr(debug, "entry", None)
+                if debug_entry is not None and hasattr(debug_entry, "PdbFileName"):
+                    pdb_paths.append(_decode_name(debug_entry.PdbFileName))
 
         clr_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[14] if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) > 14 else None
         is_dotnet = bool(clr_dir and _as_int(clr_dir.VirtualAddress) and _as_int(clr_dir.Size))
@@ -648,8 +648,8 @@ class PEAnalyzer(Analyzer):
             "timestamp": timestamp,
             "timestamp_iso": _ts(timestamp),
             "image_base": _hex(image_base),
-            "entry_point_rva": _hex(entry),
-            "entry_point_section": _entry_point_section(sections, entry),
+            "entry_point_rva": _hex(entry_rva),
+            "entry_point_section": _entry_point_section(sections, entry_rva),
             "section_count": len(sections),
             "sections": sections,
             "rwx_sections": wx_sections,

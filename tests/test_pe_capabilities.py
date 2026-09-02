@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+from exsoftware.analyzers.pe import PEAnalyzer
 from exsoftware.cli import render_text
 from exsoftware.composition import compose
 from exsoftware.content import content_id_from_digest
@@ -292,6 +294,48 @@ def test_toolhelp_process_enumeration_requires_compound_evidence():
 
     caps = _caps(_report({"kernel32.dll": ["CreateToolhelp32Snapshot", "Process32FirstW"]}))
     assert "CAP.DISCOVERY.PE_TOOLHELP_PROCESS_ENUM.001" in caps
+
+
+def test_pe_entry_point_section_survives_import_and_debug_entry_metadata():
+    class FakeSection:
+        Name = b".text\x00\x00\x00"
+        SizeOfRawData = 0x200
+        Misc_VirtualSize = 0x300
+        Characteristics = 0x60000020
+        VirtualAddress = 0x1000
+
+        def get_data(self):
+            return b"\x90" * 16
+
+    data_dir = [SimpleNamespace(VirtualAddress=0, Size=0) for _ in range(15)]
+    pe = SimpleNamespace(
+        FILE_HEADER=SimpleNamespace(Machine=0x8664, Characteristics=0x0002, TimeDateStamp=0),
+        OPTIONAL_HEADER=SimpleNamespace(
+            Subsystem=3,
+            Magic=0x20B,
+            ImageBase=0x140000000,
+            AddressOfEntryPoint=0x1000,
+            DATA_DIRECTORY=data_dir,
+        ),
+        sections=[FakeSection()],
+        DIRECTORY_ENTRY_IMPORT=[
+            SimpleNamespace(
+                dll=b"KERNEL32.dll",
+                imports=[SimpleNamespace(name=b"CreateFileW", ordinal=None)],
+            )
+        ],
+        DIRECTORY_ENTRY_DEBUG=[
+            SimpleNamespace(struct=SimpleNamespace(Type=2), entry=SimpleNamespace(PdbFileName=b"sample.pdb\x00"))
+        ],
+    )
+    pe.get_overlay_data_start_offset = lambda: None
+    pe.get_imphash = lambda: ""
+
+    result = PEAnalyzer()._analyze_pe(pe, SimpleNamespace(data=b"MZ", size=2))
+
+    assert result.status == "completed"
+    assert result.details["entry_point_rva"] == "0x1000"
+    assert result.details["entry_point_section"]["name"] == ".text"
 
 
 def test_generic_dynamic_api_does_not_create_malicious_finding():
