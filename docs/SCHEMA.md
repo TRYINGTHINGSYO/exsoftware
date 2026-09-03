@@ -152,6 +152,14 @@ launch was attempted for the analysis. Each row records:
   and non-enforced `weaker_capabilities`
 - protocol identity plus bounded launch/token/job/policy evidence relevant to
   understanding a downgrade
+- Unix workers may also include `start_new_session` and a `bootstrap_ack`
+  evidence object (`status`, optional `results`, `promoted`). Readers that do
+  not recognize these keys can ignore them. `bootstrap_ack.status` of `ok` is
+  the only ACK outcome that may have promoted filesystem/network/memory/cpu
+  from a schema-validated child attestation; it is not independent proof the
+  restriction held. `missing`, `truncated`, `malformed`, `contradictory`,
+  `timeout`, `crash_before_ack`, and `oversized` never correspond to a new
+  `enforced` claim from the ACK.
 
 The sibling `limits.isolation.mechanism` and `.capabilities` fields remain for
 compatibility, but are conservative aggregates over the complete worker list.

@@ -36,6 +36,8 @@ ISOLATION_EVIDENCE_FIELDS = (
     "suspended_start",
     "process_group",
     "unix_support",
+    "start_new_session",
+    "bootstrap_ack",
     "workdir_removed",
 )
 

@@ -16,6 +16,7 @@ from typing import Any
 
 from ..content import sha256_hex
 from ..limits import RecursionLimits
+from .bootstrap import attach_bootstrap_ack
 from .ole_protocol import (
     OLE_PROTOCOL,
     OLE_PROTOCOL_VERSION,
@@ -128,6 +129,13 @@ class IsolatedOleRunner:
             if rc is None:
                 isolation["termination"] = terminate_tree(proc)
                 isolation["stdio"] = finish_streams(stdout, stderr)
+                attach_bootstrap_ack(
+                    isolation,
+                    policy,
+                    workdir,
+                    timed_out=True,
+                    returncode=proc.returncode,
+                )
                 isolation["duration_ms"] = (perf_counter() - started) * 1000
                 return OleRefineResult(
                     status="timeout",
@@ -138,6 +146,13 @@ class IsolatedOleRunner:
                 )
             isolation["returncode"] = rc
             isolation["stdio"] = finish_streams(stdout, stderr)
+            attach_bootstrap_ack(
+                isolation,
+                policy,
+                workdir,
+                timed_out=False,
+                returncode=rc,
+            )
             return self._ingest(workdir, artifact_id, isolation, rc, started)
         except Exception as exc:
             isolation["spawn_error"] = str(exc)

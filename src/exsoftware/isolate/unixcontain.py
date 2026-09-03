@@ -1,81 +1,156 @@
-"""Unix-family containment: landlock / network namespace where the kernel allows it."""
+"""Unix-family containment: Landlock / network namespace / rlimits.
+
+Session creation is parent-visible (``Popen(start_new_session=True)``).
+Landlock, ``CLONE_NEWNET``, and rlimits are applied in the child bootstrap
+phase *before* any analyzer or third-party parser reads hostile sample bytes.
+The child then writes a bounded ACK. The parent promotes filesystem/network/
+memory/cpu only from a schema-validated child attestation that is consistent
+with host feature detection. That ACK is not independent proof the restriction
+held. Feature detection and a later successful run never create ``enforced``.
+"""
 
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .policy import IsolationPolicy
 
 
-def unix_preexec(policy: IsolationPolicy, workdir: Path, allow_paths: list[Path]) -> Callable[[], None]:
-    """Return a preexec_fn that attempts Landlock, netns, and rlimits.
+def unix_runtime_allow_paths() -> list[Path]:
+    """Interpreter and package paths the Landlock ruleset must still allow."""
+    from .process import host_site_package_dirs
 
-    The parent establishes the session with ``start_new_session=True``. This
-    hook must not attempt to create the session itself. Child-side apply
-    failures are invisible to the parent; callers must not report those
-    protections as enforced from feature detection alone.
+    return [
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.executable).resolve().parent,
+        Path(__file__).resolve().parents[2],
+        *host_site_package_dirs(),
+    ]
+
+
+def apply_unix_restrictions(
+    *,
+    workdir: Path,
+    allow_paths: list[Path],
+    max_memory_bytes: int | None,
+    max_cpu_seconds: float | None,
+    max_processes: int | None,
+) -> dict[str, str]:
+    """Apply Unix restrictions in the current process and return ACK result states.
+
+    Must run before hostile sample bytes are parsed. Failures are returned as
+    ``failed`` / ``unsupported`` rather than swallowed into a silent success.
     """
+    results = {
+        "session": _session_result(),
+        "network": _apply_unshare_net(),
+        "filesystem": _apply_landlock(workdir, allow_paths),
+        "memory": _apply_rlimit_as(max_memory_bytes),
+        "cpu": _apply_rlimit_cpu(max_cpu_seconds),
+    }
+    _apply_rlimit_nproc(max_processes)
+    return results
 
-    def _preexec() -> None:
-        _try_unshare_net()
-        _try_landlock(workdir, allow_paths)
-        _try_rlimits(policy)
 
-    return _preexec
+def _session_result() -> str:
+    getsid = getattr(os, "getsid", None)
+    if getsid is None:
+        return "unsupported"
+    try:
+        if getsid(0) == os.getpid():
+            return "applied"
+        return "failed"
+    except OSError:
+        return "failed"
 
 
-def _try_unshare_net() -> None:
+def _apply_unshare_net() -> str:
     if sys.platform != "linux":
-        return
+        return "unsupported"
     flags = getattr(os, "CLONE_NEWNET", None)
     unshare = getattr(os, "unshare", None)
     if flags is None or unshare is None:
-        return
+        return "unsupported"
     try:
         unshare(flags)
     except OSError:
-        return
+        return "failed"
+    return "applied"
 
 
-def _try_rlimits(policy: IsolationPolicy) -> None:
-    try:
-        import resource
-    except ImportError:
-        return
-    cpu = policy.max_cpu_seconds
-    if cpu:
-        value = max(1, int(cpu))
-        try:
-            resource.setrlimit(resource.RLIMIT_CPU, (value, value))
-        except (ValueError, OSError, resource.error):
-            pass
-    memory = policy.max_memory_bytes
-    if memory:
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (int(memory), int(memory)))
-        except (ValueError, OSError, AttributeError, resource.error):
-            pass
-    nproc = policy.max_processes
-    if nproc and hasattr(resource, "RLIMIT_NPROC"):
-        try:
-            resource.setrlimit(resource.RLIMIT_NPROC, (int(nproc), int(nproc)))
-        except (ValueError, OSError, resource.error):
-            pass
-
-
-def _try_landlock(workdir: Path, allow_paths: list[Path]) -> None:
+def _apply_landlock(workdir: Path, allow_paths: list[Path]) -> str:
     if sys.platform != "linux":
-        return
+        return "unsupported"
     try:
-        from .landlock import apply_landlock
+        from .landlock import apply_landlock, landlock_available
     except Exception:
-        return
+        return "unsupported"
+    try:
+        available = landlock_available()
+    except Exception:
+        return "unsupported"
+    if not available:
+        return "unsupported"
     try:
         apply_landlock(workdir, allow_paths)
     except OSError:
+        return "failed"
+    return "applied"
+
+
+def _resource_module():
+    try:
+        import resource
+    except ImportError:
+        return None
+    return resource
+
+
+def _apply_rlimit_as(memory: int | None) -> str:
+    resource = _resource_module()
+    if resource is None or not hasattr(resource, "RLIMIT_AS"):
+        return "unsupported"
+    if not memory:
+        return "unsupported"
+    value = int(memory)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (value, value))
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    except (ValueError, OSError, AttributeError, resource.error):
+        return "failed"
+    if soft != value or hard != value:
+        return "failed"
+    return "applied"
+
+
+def _apply_rlimit_cpu(cpu: float | None) -> str:
+    resource = _resource_module()
+    if resource is None or not hasattr(resource, "RLIMIT_CPU"):
+        return "unsupported"
+    if not cpu:
+        return "unsupported"
+    value = max(1, int(cpu))
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (value, value))
+        soft, hard = resource.getrlimit(resource.RLIMIT_CPU)
+    except (ValueError, OSError, AttributeError, resource.error):
+        return "failed"
+    if soft != value or hard != value:
+        return "failed"
+    return "applied"
+
+
+def _apply_rlimit_nproc(nproc: int | None) -> None:
+    resource = _resource_module()
+    if resource is None or not nproc or not hasattr(resource, "RLIMIT_NPROC"):
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NPROC, (int(nproc), int(nproc)))
+    except (ValueError, OSError, resource.error):
         return
 
 
@@ -113,12 +188,14 @@ def apply_unix_policy(
     rlimit_as: bool,
     session_established: bool = False,
 ) -> None:
-    """Map Unix launch evidence onto capabilities.
+    """Map parent-visible Unix launch evidence onto capabilities.
 
     ``landlock_applied`` / ``unshare_applied`` / rlimit flags mean the parent
-    *attempted* those child-side applies (usually because the feature exists).
-    They are not proof the restriction attached. Only ``session_established``
-    is parent-visible (``Popen(start_new_session=True)`` succeeded).
+    detected that the child *will attempt* those applies. They are not proof
+    the restriction attached. Only ``session_established`` is parent-visible
+    (``Popen(start_new_session=True)`` succeeded) and may be ``enforced``
+    before a bootstrap ACK. Filesystem/network/memory/cpu stay degraded or
+    unsupported until a validated ACK reports ``applied``.
     """
     if session_established:
         policy.process_tree_limit = "enforced"
@@ -139,7 +216,7 @@ def apply_unix_policy(
         policy.filesystem_restriction = "degraded"
         policy.mechanism = "landlock" if not unshare_applied else "landlock+netns"
         policy.reasons["filesystem_restriction"] = (
-            "Landlock is attempted in preexec when available; this run did not empirically verify denial"
+            "Landlock is available; not enforced until a validated bootstrap ACK reports applied"
         )
     elif sys.platform == "linux":
         policy.filesystem_restriction = "unsupported"
@@ -150,7 +227,7 @@ def apply_unix_policy(
     if unshare_applied:
         policy.network_restriction = "degraded"
         policy.reasons["network_restriction"] = (
-            "CLONE_NEWNET is attempted in preexec; this run did not empirically verify denial"
+            "CLONE_NEWNET is available; not enforced until a validated bootstrap ACK reports applied"
         )
         if policy.mechanism == "none":
             policy.mechanism = "netns"
@@ -167,7 +244,7 @@ def apply_unix_policy(
     if rlimit_as:
         policy.memory_limit = "degraded"
         policy.reasons["memory_limit"] = (
-            "RLIMIT_AS is attempted in preexec; this run did not parent-verify the limit attached"
+            "RLIMIT_AS is available; not enforced until a validated bootstrap ACK reports applied"
         )
     else:
         policy.memory_limit = "unsupported"
@@ -175,7 +252,7 @@ def apply_unix_policy(
     if rlimit_cpu:
         policy.cpu_limit = "degraded"
         policy.reasons["cpu_limit"] = (
-            "RLIMIT_CPU is attempted in preexec; this run did not parent-verify the limit attached"
+            "RLIMIT_CPU is available; not enforced until a validated bootstrap ACK reports applied"
         )
     else:
         policy.cpu_limit = "unsupported"
