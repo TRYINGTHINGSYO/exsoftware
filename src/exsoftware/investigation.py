@@ -16,6 +16,7 @@ from .models import (
     Relationship,
 )
 from .rules.catalog import resolve_rule
+from .rules.elf_capabilities import normalize_elf_library_name, normalize_elf_symbol_name
 
 try:
     from datetime import UTC
@@ -613,6 +614,16 @@ class Investigation:
         elif analyzer_id == "elf":
             for name in details.get("needed") or []:
                 target = self.add_named_artifact("library", name)
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="elf-needed",
+                    summary=f"ELF DT_NEEDED {name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    value=name,
+                    extra={"normalized_library": normalize_elf_library_name(name)},
+                    run_id=run_id,
+                )
                 self.add_relationship(
                     "DEPENDS_ON",
                     artifact_id,
@@ -620,6 +631,48 @@ class Investigation:
                     analyzer_id=analyzer_id,
                     analyzer_version=analyzer_version,
                     certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    extra={"normalized_library": normalize_elf_library_name(name)},
+                    run_id=run_id,
+                )
+            for item in _elf_import_features(details):
+                raw_name = item.get("name") or "unknown"
+                library = item.get("library") or "unknown"
+                normalized_name = item.get("normalized_name") or normalize_elf_symbol_name(raw_name)
+                normalized_library = item.get("normalized_library") or normalize_elf_library_name(library)
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="elf-import-function",
+                    summary=f"ELF import {library}!{raw_name}" if library != "unknown" else f"ELF import {raw_name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    location=f"dynsym {library}" if library != "unknown" else "dynsym",
+                    value=raw_name,
+                    extra={
+                        "library": library,
+                        "normalized_library": normalized_library,
+                        "normalized_name": normalized_name,
+                        "version": item.get("version"),
+                    },
+                    run_id=run_id,
+                )
+                self.add_observation(
+                    artifact_id=artifact_id,
+                    kind="elf.import.function",
+                    statement=(
+                        f"ELF imports {library}!{raw_name}" if library != "unknown" else f"ELF imports {raw_name}"
+                    ),
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    data={
+                        "library": library,
+                        "normalized_library": normalized_library,
+                        "name": raw_name,
+                        "normalized_name": normalized_name,
+                        "version": item.get("version"),
+                    },
                     run_id=run_id,
                 )
         elif analyzer_id == "macho":
@@ -720,3 +773,10 @@ def _pe_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
                 }
             )
     return out
+
+
+def _elf_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
+    features = details.get("imported_functions")
+    if isinstance(features, list):
+        return [item for item in features if isinstance(item, dict)]
+    return []

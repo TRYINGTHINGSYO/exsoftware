@@ -143,7 +143,15 @@ def _from_graph(report: Report, capabilities: list[dict]) -> list[dict]:
                 "refs": graph_ref(relationship_ids=[rel.id for rel in encrypted[:8]]),
             }
         )
-    dyn = [item for item in capabilities if item["id"] == "CAP.DYNAMIC_LOADING.PE_LOADLIBRARY.001"]
+    dyn = [
+        item
+        for item in capabilities
+        if item["id"]
+        in {
+            "CAP.DYNAMIC_LOADING.PE_LOADLIBRARY.001",
+            "CAP.DYNAMIC_LOADING.ELF_DLOPEN.001",
+        }
+    ]
     if dyn:
         out.append(
             {
