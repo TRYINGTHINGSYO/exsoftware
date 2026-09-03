@@ -2,6 +2,11 @@
 
 Reads request.json + input.bin from a controlled work directory, runs exactly
 one analyzer, writes response.json. Does not ingest into the investigation graph.
+
+On Unix, Landlock / netns / rlimits are applied in a bootstrap phase *before*
+any analyzer or third-party parser reads hostile sample bytes. The parent
+schema-validates a bounded child ACK from that phase; this process must not
+parse samples until that phase has completed.
 """
 
 from __future__ import annotations
@@ -24,7 +29,10 @@ from .protocol import (
     TEST_ENV,
     WORKDIR_ENV,
 )
+from .bootstrap import ACK_NAME, BOOTSTRAP_HOOK_ENV, write_bootstrap_ack
 from .validate import ProtocolError, validate_request
+
+_UNIX_BOOTSTRAP_COMPLETE = False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,13 +47,13 @@ def main(argv: list[str] | None = None) -> int:
     os_environ_set(WORKDIR_ENV, str(workdir))
     started = perf_counter()
     try:
+        _run_unix_bootstrap(workdir)
         request = json.loads(request_path.read_text(encoding="utf-8"))
         if request.get("protocol") == "exsoftware.container":
             return _run_container(request, workdir, response_path, started)
         if request.get("protocol") == "exsoftware.ole":
             return _run_ole(request, workdir, response_path, started)
         validate_request(request)
-        _apply_requested_rlimits(request.get("limits") or {})
         result = _run(request, workdir)
         status = result.status
         error = None
@@ -97,10 +105,10 @@ def _run_container(request: dict, workdir: Path, response_path: Path, started: f
     from .container_extract import run_extract
     from .container_protocol import CONTAINER_PROTOCOL, CONTAINER_PROTOCOL_VERSION, validate_container_request
 
+    _ensure_unix_bootstrap_complete()
     artifact_id = request.get("container_artifact_id") or ""
     try:
         validate_container_request(request)
-        _apply_requested_rlimits(request.get("limits") or {})
         body = run_extract(request, workdir)
     except ProtocolError as exc:
         body = {
@@ -144,10 +152,10 @@ def _run_ole(request: dict, workdir: Path, response_path: Path, started: float) 
     from .ole_protocol import OLE_PROTOCOL, OLE_PROTOCOL_VERSION, validate_ole_request
     from .ole_refine import run_refine
 
+    _ensure_unix_bootstrap_complete()
     artifact_id = request.get("artifact_id") or ""
     try:
         validate_ole_request(request)
-        _apply_requested_rlimits(request.get("limits") or {})
         body = run_refine(request, workdir)
     except ProtocolError as exc:
         body = {
@@ -179,6 +187,7 @@ def _run_ole(request: dict, workdir: Path, response_path: Path, started: float) 
 
 
 def _run(request: dict, workdir: Path) -> AnalyzerResult:
+    _ensure_unix_bootstrap_complete()
     analyzer_id = request["analyzer_id"]
     analyzer_version = request["analyzer_version"]
     cls = resolve_analyzer_class(analyzer_id)
@@ -356,32 +365,94 @@ def _atomic_write(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def _apply_requested_rlimits(limits: dict) -> None:
+def _run_unix_bootstrap(workdir: Path) -> None:
+    """Apply Unix restrictions and write the ACK before hostile-byte work."""
+    global _UNIX_BOOTSTRAP_COMPLETE
+    if sys.platform == "win32":
+        _UNIX_BOOTSTRAP_COMPLETE = True
+        return
+    import os
+    import time
+
+    from .unixcontain import apply_unix_restrictions, unix_runtime_allow_paths
+
+    hook = os.environ.get(BOOTSTRAP_HOOK_ENV) if os.environ.get(TEST_ENV) == "1" else None
+    if hook == "crash":
+        os.abort()
+    if hook == "hang":
+        while True:
+            time.sleep(60)
+
+    limits = _limits_from_request(workdir)
+    results = apply_unix_restrictions(
+        workdir=workdir,
+        allow_paths=unix_runtime_allow_paths(),
+        max_memory_bytes=_optional_int(limits.get("max_memory_bytes")),
+        max_cpu_seconds=_optional_float(limits.get("max_cpu_seconds")),
+        max_processes=_optional_int(limits.get("max_child_processes")),
+    )
+    if hook == "unsupported_filesystem":
+        results = {**results, "filesystem": "unsupported"}
+    if hook == "fail_memory":
+        results = {**results, "memory": "failed"}
+    if hook == "skip_ack":
+        _UNIX_BOOTSTRAP_COMPLETE = True
+        return
+    if hook == "malformed":
+        (workdir / ACK_NAME).write_text(
+            '{"protocol":"exsoftware.isolate.bootstrap","protocol_version":1,'
+            '"filesystem":"nope","network":"applied","memory":"applied","cpu":"applied","session":"applied"}',
+            encoding="utf-8",
+        )
+        _UNIX_BOOTSTRAP_COMPLETE = True
+        return
+    if hook == "truncated":
+        (workdir / ACK_NAME).write_text(
+            '{"protocol":"exsoftware.isolate.bootstrap","protocol_version":1',
+            encoding="utf-8",
+        )
+        _UNIX_BOOTSTRAP_COMPLETE = True
+        return
+    if hook == "contradict":
+        write_bootstrap_ack(workdir, {key: "applied" for key in results})
+        _UNIX_BOOTSTRAP_COMPLETE = True
+        return
+    write_bootstrap_ack(workdir, results)
+    _UNIX_BOOTSTRAP_COMPLETE = True
+
+
+def _ensure_unix_bootstrap_complete() -> None:
     if sys.platform == "win32":
         return
+    if not _UNIX_BOOTSTRAP_COMPLETE:
+        raise RuntimeError("Unix bootstrap containment has not completed")
+
+
+def _limits_from_request(workdir: Path) -> dict:
     try:
-        import resource
-    except ImportError:
-        return
-    cpu = limits.get("max_cpu_seconds")
-    memory = limits.get("max_memory_bytes")
-    nproc = limits.get("max_child_processes")
-    if cpu:
-        value = max(1, int(cpu))
-        try:
-            resource.setrlimit(resource.RLIMIT_CPU, (value, value))
-        except (ValueError, OSError, resource.error):
-            pass
-    if memory:
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (int(memory), int(memory)))
-        except (ValueError, OSError, AttributeError, resource.error):
-            pass
-    if nproc and hasattr(resource, "RLIMIT_NPROC"):
-        try:
-            resource.setrlimit(resource.RLIMIT_NPROC, (int(nproc), int(nproc)))
-        except (ValueError, OSError, resource.error):
-            pass
+        data = json.loads((workdir / "request.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    limits = data.get("limits") if isinstance(data, dict) else None
+    return limits if isinstance(limits, dict) else {}
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value is False:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value is False:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def os_environ_set(key: str, value: str) -> None:

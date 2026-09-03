@@ -182,6 +182,11 @@ def child_env(*, test_mode: bool, workdir: Path) -> dict[str, str]:
         env["LOGNAME"] = "exsoftware-analyzer"
     if test_mode:
         env["EXSOFTWARE_ISOLATE_TEST"] = "1"
+        from .bootstrap import BOOTSTRAP_HOOK_ENV
+
+        hook = os.environ.get(BOOTSTRAP_HOOK_ENV)
+        if hook:
+            env[BOOTSTRAP_HOOK_ENV] = hook
     return env
 
 
@@ -330,17 +335,9 @@ def _spawn_windows_fallback(command, workdir, env, stdout, stderr, job):
 
 
 def _spawn_unix(command, workdir, env, policy, stdout, stderr):
-    from .unixcontain import apply_unix_policy, describe_unix_support, unix_preexec
+    from .unixcontain import apply_unix_policy, describe_unix_support
 
-    allow = [
-        Path(sys.prefix),
-        Path(sys.base_prefix),
-        Path(sys.executable).resolve().parent,
-        Path(__file__).resolve().parents[2],
-        *host_site_package_dirs(),
-    ]
     support = describe_unix_support()
-    preexec = unix_preexec(policy, workdir, allow)
     proc = subprocess.Popen(
         command,
         cwd=str(workdir),
@@ -350,13 +347,13 @@ def _spawn_unix(command, workdir, env, policy, stdout, stderr):
         stderr=stderr.child_fd,
         close_fds=True,
         start_new_session=True,
-        preexec_fn=preexec,
     )
     stdout.close_write()
     stderr.close_write()
     proc._exsoftware_job = None  # type: ignore[attr-defined]
     # Popen returning means the parent-established session exists. Landlock,
-    # netns, and rlimit still run in preexec and are not parent-verified.
+    # netns, and rlimit are applied in the child bootstrap phase and attested in
+    # a schema-validated ACK. Feature detection alone is not enforcement.
     landlock = bool(support.get("landlock"))
     unshare = bool(support.get("unshare_net"))
     rlimit = bool(support.get("rlimit"))

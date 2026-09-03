@@ -13,6 +13,7 @@ This is an implementation detail of analyzer execution. Report `schema_version` 
 <temp>/exsoftware-isolate/w-*/
   input.bin        bytes the analyzer is allowed to parse
   request.json     IsolateRequest
+  bootstrap.ack    Unix bootstrap ACK (absent on Windows)
   response.json    IsolateResponse (written by the child)
 
 Stdout and stderr are captured through bounded pipes in the parent (default 64 KiB), not log files in the workspace.
@@ -134,7 +135,51 @@ The parent measures wall-clock time around wait(). On timeout it terminates the 
 
 The parent does not follow symlinks/reparse points when reading `response.json`. Stdout and stderr are pipes with a byte cap. The child environment is a minimal block, not a copy of the operator's environment.
 
-Each run records `details.isolation.capabilities` (`enforced` / `degraded` / `unsupported` / `failed`). The engine must not report `enforced` unless the live child actually held that restriction.
+Each run records `details.isolation.capabilities` (`enforced` / `degraded` / `unsupported` / `failed`). The engine must not report `enforced` from feature detection or from a later successful analyzer result.
+
+## Unix bootstrap acknowledgment (`exsoftware.isolate.bootstrap`)
+
+Unix workers apply Landlock, `CLONE_NEWNET`, and rlimits in a bootstrap phase **before** reading `input.bin` or importing analyzer/parser implementations that operate on sample bytes. The child then writes `bootstrap.ack`. Analyzer, container (`exsoftware.container`), and OLE (`exsoftware.ole`) workers share this path. The parent validates schema and consistency with host feature flags. That is **parent-validated child attestation**, not independent verification that the restriction held.
+
+```
+<temp>/exsoftware-isolate/w-*/
+  input.bin
+  request.json
+  bootstrap.ack    Unix child; written before hostile-byte parsing
+  response.json
+```
+
+The ACK is hostile child output. The parent reads it with the same no-follow, bounded-size workspace helper used for `response.json` (cap: 4096 bytes). Schema is closed: unknown fields, missing fields, non-UTF-8, non-JSON, and invalid enums are rejected.
+
+```json
+{
+  "protocol": "exsoftware.isolate.bootstrap",
+  "protocol_version": 1,
+  "filesystem": "applied",
+  "network": "unsupported",
+  "memory": "applied",
+  "cpu": "applied",
+  "session": "applied"
+}
+```
+
+Each result field is exactly one of `applied`, `unsupported`, `failed`.
+
+Parent promotion (filesystem / network / memory / CPU only). This is
+schema-validated child attestation, not independent proof:
+
+| ACK | Capability |
+| --- | --- |
+| valid `applied` and parent feature support is present | `enforced` |
+| valid `unsupported` | `unsupported` |
+| valid `failed` | `failed` |
+| missing, empty, truncated, malformed, oversized, contradictory, timeout before ACK, crash before ACK | **no promotion**; spawn-time `degraded`/`unsupported` remains. Never `enforced` |
+
+Contradiction: any `applied` result whose parent feature flag is false (`landlock`, `unshare_net`, or `rlimit`). The entire ACK is rejected; no capability from it becomes `enforced`.
+
+`session` is recorded as evidence. `process_tree_limit=enforced` comes only from `Popen(start_new_session=True)`, not from the child field. Analyzer success after ACK does not create enforcement that the ACK did not already justify.
+
+Windows workers do not write or ingest this file.
 
 ## Container protocol (`exsoftware.container`)
 

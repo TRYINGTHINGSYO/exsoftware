@@ -17,6 +17,7 @@ from typing import Any
 from ..content import digest_fd
 from ..identify import refine_zip_type_from_names
 from ..limits import RecursionLimits
+from .bootstrap import attach_bootstrap_ack
 from .container_protocol import (
     CONTAINER_PROTOCOL,
     CONTAINER_PROTOCOL_VERSION,
@@ -181,6 +182,13 @@ class IsolatedContainerRunner:
             if rc is None:
                 isolation["termination"] = terminate_tree(proc)
                 isolation["stdio"] = finish_streams(stdout, stderr)
+                attach_bootstrap_ack(
+                    isolation,
+                    policy,
+                    workdir,
+                    timed_out=True,
+                    returncode=proc.returncode,
+                )
                 isolation["duration_ms"] = (perf_counter() - started) * 1000
                 return ContainerResult(
                     status="timeout",
@@ -193,6 +201,13 @@ class IsolatedContainerRunner:
                 )
             isolation["returncode"] = rc
             isolation["stdio"] = finish_streams(stdout, stderr)
+            attach_bootstrap_ack(
+                isolation,
+                policy,
+                workdir,
+                timed_out=False,
+                returncode=rc,
+            )
             return self._ingest(workdir, artifact_id, isolation, rc, started)
         except Exception as exc:
             isolation["spawn_error"] = str(exc)

@@ -13,6 +13,7 @@ from ..content import digest_bytes
 from ..context import AnalysisContext
 from ..limits import RecursionLimits
 from ..models import AnalyzerError, AnalyzerResult
+from .bootstrap import attach_bootstrap_ack
 from .output import BoundedStream, finish_streams
 from .policy import IsolationPolicy
 from .process import child_env, close_job, create_output_streams, pid_alive, spawn_worker, terminate_tree, wait_or_timeout
@@ -135,6 +136,13 @@ class IsolatedAnalyzerRunner:
                 isolation["termination"] = terminate_tree(proc)
                 isolation["still_alive"] = proc.poll() is None
             isolation["stdio"] = finish_streams(stdout, stderr)
+            attach_bootstrap_ack(
+                isolation,
+                policy,
+                workdir,
+                timed_out=rc is None,
+                returncode=proc.returncode,
+            )
             if rc is None:
                 result = _status_result(
                     spec,

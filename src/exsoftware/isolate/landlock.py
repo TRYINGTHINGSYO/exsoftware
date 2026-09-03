@@ -1,4 +1,4 @@
-"""Linux Landlock filesystem restriction. Applied in the child before exec or at worker start."""
+"""Linux Landlock filesystem restriction. Applied in the child bootstrap phase before hostile sample parsing."""
 
 from __future__ import annotations
 

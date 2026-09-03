@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from exsoftware.isolate import process, unixcontain
 from exsoftware.isolate.policy import IsolationPolicy
-from exsoftware.isolate.unixcontain import apply_unix_policy, unix_preexec
+from exsoftware.isolate.unixcontain import apply_unix_policy
 
 
 class FakeStream:
@@ -46,10 +46,10 @@ def test_apply_unix_policy_does_not_overclaim_unverified_protections():
     assert policy.network_restriction == "degraded"
     assert policy.memory_limit == "degraded"
     assert policy.cpu_limit == "degraded"
-    assert "not empirically verify" in policy.reasons["filesystem_restriction"]
-    assert "not empirically verify" in policy.reasons["network_restriction"]
-    assert "not parent-verify" in policy.reasons["memory_limit"]
-    assert "not parent-verify" in policy.reasons["cpu_limit"]
+    assert "validated bootstrap ACK" in policy.reasons["filesystem_restriction"]
+    assert "validated bootstrap ACK" in policy.reasons["network_restriction"]
+    assert "validated bootstrap ACK" in policy.reasons["memory_limit"]
+    assert "validated bootstrap ACK" in policy.reasons["cpu_limit"]
 
 
 def test_apply_unix_policy_enforces_process_tree_only_when_session_established():
@@ -79,37 +79,6 @@ def test_apply_unix_policy_enforces_process_tree_only_when_session_established()
     assert with_session.network_restriction == "unsupported"
     assert with_session.memory_limit == "unsupported"
     assert with_session.cpu_limit == "unsupported"
-
-
-def test_unix_preexec_does_not_call_setsid(monkeypatch, tmp_path):
-    calls: list = []
-    allow_paths = [tmp_path / "allow"]
-    policy = _policy()
-
-    monkeypatch.setattr(unixcontain, "_try_unshare_net", lambda: calls.append("unshare_net"))
-    monkeypatch.setattr(
-        unixcontain,
-        "_try_landlock",
-        lambda workdir, allow: calls.append(("landlock", workdir, allow)),
-    )
-    monkeypatch.setattr(
-        unixcontain,
-        "_try_rlimits",
-        lambda applied_policy: calls.append(("rlimits", applied_policy)),
-    )
-
-    def fail_setsid() -> None:
-        raise AssertionError("unix_preexec must not call os.setsid")
-
-    monkeypatch.setattr(unixcontain.os, "setsid", fail_setsid, raising=False)
-
-    unix_preexec(policy, tmp_path, allow_paths)()
-
-    assert calls == [
-        "unshare_net",
-        ("landlock", tmp_path, allow_paths),
-        ("rlimits", policy),
-    ]
 
 
 def test_spawn_unix_passes_start_new_session_true(monkeypatch, tmp_path):
@@ -147,7 +116,7 @@ def test_spawn_unix_passes_start_new_session_true(monkeypatch, tmp_path):
 
     assert child is fake
     assert captured["kwargs"]["start_new_session"] is True
-    assert captured["kwargs"]["preexec_fn"] is not None
+    assert captured["kwargs"].get("preexec_fn") is None
     assert stdout.write_closed is True
     assert stderr.write_closed is True
     assert meta["start_new_session"] is True

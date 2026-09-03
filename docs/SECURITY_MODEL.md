@@ -91,7 +91,7 @@ Format parsers (`pefile`, `pypdf`, `olefile`, `zipfile`, …) must not run in th
 
 Each analyzer run records `details.isolation.capabilities` with only:
 
-- `enforced` — live child held the restriction (token/job query and/or denied probe)
+- `enforced` — parent-visible evidence that the live child held the restriction (Windows token/job query and/or a denied live probe). Unix Landlock/netns/rlimit `enforced` is a **schema-validated child attestation** of apply, consistent with host feature detection; it is not independent proof the restriction held. Unix `process_tree_limit` remains parent-visible (`start_new_session=True`).
 - `degraded` — partial restriction
 - `unsupported` — not available
 - `failed` — claimed restriction did not hold
@@ -138,6 +138,19 @@ Fallback if AppContainer launch fails: restricted token + Low integrity (needs `
 
 ## Unix-family
 
-The parent creates the worker in a new session (`subprocess.Popen(..., start_new_session=True)`). That parent-visible session is what makes `process_tree_limit=enforced` and lets timeout use `killpg`. Landlock, `CLONE_NEWNET`, and rlimits are still attempted in `preexec_fn` when the kernel supports them, but those child-side applies are not parent-verified. Per-run filesystem and network claims stay **degraded** (or **unsupported** if the feature is absent) unless live denial probes confirm the restriction held. CPU and memory claims remain **degraded** until there is parent-observable confirmation or a future validated bootstrap acknowledgment/probe for the child-side rlimit setup. A swallowed `setsid()` in preexec is not used as evidence.
+The parent creates the worker in a new session (`subprocess.Popen(..., start_new_session=True)`). That parent-visible session is what makes `process_tree_limit=enforced` and lets timeout use `killpg`.
+
+Landlock, `CLONE_NEWNET`, `RLIMIT_AS`, and `RLIMIT_CPU` are applied in a **child bootstrap phase** after exec and **before** any analyzer or third-party parser reads hostile sample bytes. The child writes a bounded `bootstrap.ack` file. The parent treats those bytes as untrusted until a no-follow, size-capped, strict-schema read succeeds. A valid ACK is **child attestation**, not a parent-side proof that the restriction took effect.
+
+Per-run filesystem, network, memory, and CPU claims:
+
+- `enforced` only when a validated ACK reports `applied` for that restriction **and** the parent already knew the feature was available (ACK `applied` without parent feature support is contradictory and promotes nothing)
+- `unsupported` when the ACK reports `unsupported`, or when the feature is absent and no valid `applied` ACK exists
+- `failed` when the ACK reports `failed`
+- `degraded` after spawn, before ACK, when the feature exists but has not been acknowledged
+
+A missing, empty, truncated, malformed, oversized, contradictory, timed-out, or crash-before-ACK result **never** produces `enforced` for those four capabilities. A later successful analyzer/container/OLE result is not promotion evidence. `security-status` live denial probes remain a separate, stronger check.
+
+Windows AppContainer / Job / staging behavior is unchanged. Unix workers do not use `preexec_fn` for containment apply: operations that need an acknowledged result run in bootstrap so the child can attest them.
 
 See [ISOLATE_PROTOCOL.md](ISOLATE_PROTOCOL.md).
