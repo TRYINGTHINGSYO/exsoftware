@@ -3,7 +3,115 @@ from __future__ import annotations
 import io
 
 from ..models import Evidence, Finding
+from ..rules.elf_capabilities import normalize_elf_library_name, normalize_elf_symbol_name
 from .base import Analyzer
+
+_IMPORTED_FUNCTION_CAP = 1000
+_SYMBOL_SAMPLE_CAP = 200
+_SYMBOL_SCAN_CAP = 400
+
+
+def _decode_bytes(raw) -> str:
+    if isinstance(raw, bytes):
+        return raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+    return str(raw)
+
+
+def collect_imported_functions(elf) -> list[dict]:
+    """Return undefined dynamic symbols with optional GNU-version library binding."""
+    library_by_index = _gnu_version_libraries(elf)
+    imported: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for section in elf.iter_sections():
+        if getattr(section, "iter_symbols", None) is None or section.name != ".dynsym":
+            continue
+        for index, symbol in enumerate(section.iter_symbols()):
+            name = symbol.name
+            if not name:
+                continue
+            try:
+                shndx = symbol["st_shndx"]
+            except (KeyError, TypeError):
+                continue
+            if shndx not in {"SHN_UNDEF", 0}:
+                continue
+            try:
+                symbol_type = symbol["st_info"]["type"]
+            except (KeyError, TypeError):
+                symbol_type = ""
+            if symbol_type not in {"STT_FUNC", "STT_NOTYPE", "STT_GNU_IFUNC"}:
+                continue
+            normalized_name = normalize_elf_symbol_name(name)
+            if not normalized_name:
+                continue
+            bound = library_by_index.get(index)
+            library = bound[0] if bound else "unknown"
+            version = bound[1] if bound else None
+            normalized_library = normalize_elf_library_name(library)
+            key = (normalized_library, normalized_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            imported.append(
+                {
+                    "name": name,
+                    "normalized_name": normalized_name,
+                    "library": library,
+                    "normalized_library": normalized_library,
+                    "version": version,
+                    "symbol_type": symbol_type,
+                }
+            )
+            if len(imported) >= _IMPORTED_FUNCTION_CAP:
+                return imported
+    return imported
+
+
+def _gnu_version_libraries(elf) -> dict[int, tuple[str, str | None]]:
+    """Map .dynsym index -> (DT_NEEDED file, version name) via GNU versioning."""
+    mapping: dict[int, tuple[str, str | None]] = {}
+    try:
+        versym = elf.get_section_by_name(".gnu.version")
+        verneed = elf.get_section_by_name(".gnu.version_r")
+    except Exception:
+        return mapping
+    if versym is None or verneed is None:
+        return mapping
+    if not hasattr(versym, "iter_symbols") or not hasattr(verneed, "iter_versions"):
+        return mapping
+    index_to_file: dict[int, tuple[str, str | None]] = {}
+    try:
+        for verneed_info, verdaux_iter in verneed.iter_versions():
+            filename = getattr(verneed_info, "name", None) or ""
+            if not filename:
+                continue
+            for aux in verdaux_iter:
+                try:
+                    other = int(aux["vna_other"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                version = getattr(aux, "name", None)
+                index_to_file[other] = (str(filename), str(version) if version else None)
+    except Exception:
+        return {}
+    try:
+        for index, ver in enumerate(versym.iter_symbols()):
+            try:
+                ndx = ver["ndx"]
+            except (KeyError, TypeError):
+                continue
+            if ndx is None or isinstance(ndx, str):
+                continue
+            try:
+                ndx_int = int(ndx) & 0x7FFF
+            except (TypeError, ValueError):
+                continue
+            bound = index_to_file.get(ndx_int)
+            if bound:
+                mapping[index] = bound
+    except Exception:
+        return {}
+    return mapping
 
 
 class ELFAnalyzer(Analyzer):
@@ -27,7 +135,7 @@ class ELFAnalyzer(Analyzer):
         soname = None
         for section in elf.iter_sections():
             if section.name == ".interp":
-                interpreter = section.data().split(b"\x00", 1)[0].decode("utf-8", "replace")
+                interpreter = _decode_bytes(section.data().split(b"\x00", 1)[0])
             if isinstance(section, DynamicSection):
                 for tag in section.iter_tags():
                     if tag.entry.d_tag == "DT_NEEDED":
@@ -40,6 +148,8 @@ class ELFAnalyzer(Analyzer):
                     for tag in segment.iter_tags():
                         if tag.entry.d_tag == "DT_NEEDED":
                             needed.append(tag.needed)
+
+        imported_functions = collect_imported_functions(elf)
 
         sections = []
         for section in elf.iter_sections():
@@ -59,7 +169,7 @@ class ELFAnalyzer(Analyzer):
                     name = symbol.name
                     if name:
                         symbols.append(name)
-                if len(symbols) > 400:
+                if len(symbols) > _SYMBOL_SCAN_CAP:
                     break
 
         findings = [
@@ -126,8 +236,10 @@ class ELFAnalyzer(Analyzer):
             "interpreter": interpreter,
             "soname": soname,
             "needed": needed,
+            "needed_normalized": [normalize_elf_library_name(name) for name in needed],
+            "imported_functions": imported_functions,
             "sections": sections[:80],
-            "symbols_sample": symbols[:200],
+            "symbols_sample": symbols[:_SYMBOL_SAMPLE_CAP],
             "symbol_count": len(symbols),
         }
         return self.result(details=details, findings=findings)

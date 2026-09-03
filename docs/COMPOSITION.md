@@ -60,6 +60,13 @@ obfuscated imports, runtime-decoded functionality, and behavior implemented
 without recognizable APIs. No capability match means "not observed by these
 static rules", not "absent".
 
+ELF capabilities are inferred the same way from undefined dynamic symbols and
+DT_NEEDED libraries emitted by the isolated ELF analyzer. They can miss
+statically linked implementations, `dlsym`-resolved APIs, stripped or
+obfuscated symbols, runtime-decoded functionality, and behavior implemented
+without recognizable imports. A match is static capability inference, not
+observed runtime behavior.
+
 ## Completeness states
 
 | State | Meaning |

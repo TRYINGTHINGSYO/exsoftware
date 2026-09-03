@@ -129,6 +129,27 @@ def build_completeness(report: Report) -> tuple[dict, list[dict]]:
                 ),
             }
         )
+    if any(run.analyzer_id == "elf" and run.status == "completed" for run in report.analyzer_runs):
+        gaps.append(
+            {
+                "id": "GAP.ELF.CAPABILITIES.IMPORTS_ONLY.001",
+                "kind": "import_based_capabilities",
+                "statement": (
+                    "ELF capability inference is based on static dynamic-symbol imports and DT_NEEDED libraries. "
+                    "Statically linked code, dlsym-resolved APIs, stripped or obfuscated symbols, "
+                    "runtime-decoded functionality, and behavior without recognizable imports may be missed."
+                ),
+                "refs": graph_ref(
+                    artifact_ids=list(
+                        dict.fromkeys(
+                            run.artifact_id
+                            for run in report.analyzer_runs
+                            if run.analyzer_id == "elf" and run.status == "completed"
+                        )
+                    )
+                ),
+            }
+        )
     if encrypted_n:
         gaps.append(
             {
