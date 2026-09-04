@@ -16,6 +16,11 @@ Embed the derived view on the same report rather than a second endpoint. One ana
 
 `composition` is **not** an analyzer. It does not parse hostile bytes. It only reads the graph.
 
+The local report UI (`exsoftware serve`) reads the same `/api/analyze` document.
+The Graph tab indexes artifacts, relationships, observations, and evidence already
+on the report. Capability, gap, and observation `refs` are navigation handles,
+not new facts.
+
 ## Shape
 
 ```json
