@@ -59,6 +59,7 @@ Examples:
 - SHA-256 equals X
 - PE import table lists `winhttp.dll`
 - ELF dynamic symbol table lists `curl_easy_init`
+- Mach-O symbol table lists `_posix_spawn`
 - ZIP central directory contains `../evil.exe`
 - ASCII string `https://example.test` at offset 412
 
@@ -114,6 +115,8 @@ These values are stored on findings, observations, and relationships. They are n
 PE capability inference uses normalized observations derived from the isolated PE analyzer's import table. Raw DLL/function names remain in evidence (for example `kernel32.dll!CreateProcessW`), while matching can normalize ANSI/Unicode suffixes to one semantic primitive (`CreateProcess`). Unknown ordinal imports are preserved as evidence but do not match named capability rules.
 
 ELF capability inference uses `elf.import.function` observations from undefined `.dynsym` symbols, plus `DEPENDS_ON` edges for DT_NEEDED libraries. Raw symbol and library names remain in evidence (for example `libcurl.so.4!curl_easy_init`); matching normalizes versioned sonames (`libcurl.so.4` → `libcurl.so`) and symbol versions (`fork@GLIBC_2.2.5` → `fork`). A capability match is inferred static capability, not observed runtime behavior.
+
+Mach-O capability inference uses `macho.import.function` observations from undefined symbol-table entries, plus `DEPENDS_ON` edges for `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`. Those relationship types are unchanged. Raw names remain in evidence (for example `/usr/lib/libSystem.B.dylib!_socket`); matching strips a leading C `_` (`_posix_spawn` → `posix_spawn`), unwraps Objective-C class refs (`_OBJC_CLASS_$_NSURLSession` → `NSURLSession`), and normalizes framework/dylib paths. A capability match is inferred static capability, not observed runtime behavior. No match means not observed, never absent.
 
 ## Analyzer provenance
 

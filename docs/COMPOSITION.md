@@ -67,6 +67,14 @@ obfuscated symbols, runtime-decoded functionality, and behavior implemented
 without recognizable imports. A match is static capability inference, not
 observed runtime behavior.
 
+Mach-O capabilities are inferred the same way from undefined symbol-table
+entries and linked dylibs emitted by the isolated Mach-O analyzer. They can
+miss statically linked implementations, `dlsym`-resolved APIs, stripped or
+obfuscated symbols, runtime-decoded functionality, and behavior implemented
+without recognizable imports. No capability match means "not observed by these
+static rules", not "absent". A match is static capability inference, not
+observed runtime behavior.
+
 ## Completeness states
 
 | State | Meaning |

@@ -150,6 +150,7 @@ def _from_graph(report: Report, capabilities: list[dict]) -> list[dict]:
         in {
             "CAP.DYNAMIC_LOADING.PE_LOADLIBRARY.001",
             "CAP.DYNAMIC_LOADING.ELF_DLOPEN.001",
+            "CAP.DYNAMIC_LOADING.MACHO_DLOPEN.001",
         }
     ]
     if dyn:

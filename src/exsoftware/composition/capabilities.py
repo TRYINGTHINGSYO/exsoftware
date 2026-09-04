@@ -12,6 +12,12 @@ from ..rules.elf_capabilities import (
     normalize_elf_library_name,
     normalize_elf_symbol_name,
 )
+from ..rules.macho_capabilities import (
+    MACHO_CAPABILITY_RULES,
+    MachOCapabilityRule,
+    normalize_macho_library_name,
+    normalize_macho_symbol_name,
+)
 from ..rules.pe_capabilities import (
     PE_CAPABILITY_RULES,
     PECapabilityRule,
@@ -108,6 +114,7 @@ def infer_capabilities(report: Report) -> list[dict]:
         fns = _pe_functions(report, aid)
         hits.extend(_pe_caps(report, aid, dlls, fns))
         hits.extend(_elf_caps(report, aid))
+        hits.extend(_macho_caps(report, aid))
         hits.extend(_python_caps(report, aid, py))
         hits.extend(_script_caps(report, aid))
     out = []
@@ -579,6 +586,176 @@ def _elf_rule_refs(aid: str, rule: ELFCapabilityRule, index: dict[str, Any]) -> 
 
     for library in [*rule.libraries_all, *rule.libraries_any]:
         normalized = normalize_elf_library_name(library)
+        for rel in index["library_refs"].get(normalized, []):
+            if getattr(rel, "id", None):
+                relationship_ids.append(rel.id)
+            evidence_ids.extend(getattr(rel, "evidence_ids", None) or [])
+            labels.append(normalized)
+
+    refs = graph_ref(
+        artifact_ids=[aid],
+        observation_ids=list(dict.fromkeys(observation_ids)),
+        evidence_ids=list(dict.fromkeys(evidence_ids)),
+        relationship_ids=list(dict.fromkeys(relationship_ids)),
+        finding_ids=[],
+        rule_ids=[rule.id],
+    )
+    return refs, list(dict.fromkeys(labels))[:12]
+
+
+def _macho_libraries(report: Report, artifact_id: str) -> dict[str, object]:
+    found: dict[str, object] = {}
+    for rel in report.relationships:
+        if rel.type != "DEPENDS_ON" or rel.source_id != artifact_id:
+            continue
+        extra = rel.extra or {}
+        name = extra.get("normalized_library") or named_value(rel.target_id)
+        found[normalize_macho_library_name(str(name))] = rel
+    return found
+
+
+def _macho_caps(report: Report, aid: str) -> list[CapHit]:
+    hits: list[CapHit] = []
+    libraries = _macho_libraries(report, aid)
+    index = _macho_index(report, aid, libraries)
+    for rule in MACHO_CAPABILITY_RULES:
+        if not _macho_rule_matches(rule, index):
+            continue
+        refs, evidence = _macho_rule_refs(aid, rule, index)
+        hits.append(
+            CapHit(
+                rule.id,
+                rule.family,
+                rule.title,
+                rule.statement,
+                BEHAVIOR_NOT,
+                rule.certainty,
+                aid,
+                rule.explanation,
+                refs,
+                tuple(evidence),
+                rule.confidence,
+            )
+        )
+    return hits
+
+
+def _macho_index(report: Report, aid: str, libraries: dict) -> dict[str, Any]:
+    imports: dict[str, list[dict[str, Any]]] = {}
+    library_refs: dict[str, list[Any]] = {}
+    seen_imports: set[tuple[str, str]] = set()
+
+    for library, rel in libraries.items():
+        library_refs.setdefault(normalize_macho_library_name(library), []).append(rel)
+    for obs in report.observations:
+        if obs.artifact_id != aid or obs.kind != "macho.import.function":
+            continue
+        data = obs.data or {}
+        raw_name = str(data.get("name") or "unknown")
+        normalized_name = data.get("normalized_name") or normalize_macho_symbol_name(raw_name)
+        library = str(data.get("library") or "unknown")
+        normalized_library = normalize_macho_library_name(str(data.get("normalized_library") or library))
+        key = (normalized_library, normalized_name or raw_name)
+        if key in seen_imports:
+            continue
+        seen_imports.add(key)
+        if not normalized_name:
+            continue
+        labels = [normalized_name]
+        if normalized_library != "unknown":
+            labels.append(normalized_library)
+        imports.setdefault(normalized_name, []).append(
+            {
+                "name": raw_name,
+                "normalized_name": normalized_name,
+                "library": library,
+                "normalized_library": normalized_library,
+                "evidence_ids": list(obs.evidence_ids or []),
+                "observation_ids": [obs.id],
+                "relationship_ids": [rel.id for rel in library_refs.get(normalized_library, []) if getattr(rel, "id", None)],
+                "labels": labels,
+            }
+        )
+        library_refs.setdefault(normalized_library, [])
+
+    for run in report.analyzer_runs:
+        if run.analyzer_id != "macho" or run.artifact_id != aid or run.status != "completed":
+            continue
+        for item in _macho_import_features(run.details or {}):
+            raw_name = str(item.get("name") or "unknown")
+            normalized_name = item.get("normalized_name") or normalize_macho_symbol_name(raw_name)
+            if not normalized_name:
+                continue
+            library = str(item.get("library") or "unknown")
+            normalized_library = normalize_macho_library_name(str(item.get("normalized_library") or library))
+            key = (normalized_library, normalized_name)
+            if key in seen_imports:
+                continue
+            seen_imports.add(key)
+            labels = [normalized_name]
+            if normalized_library != "unknown":
+                labels.append(normalized_library)
+            imports.setdefault(normalized_name, []).append(
+                {
+                    "name": raw_name,
+                    "normalized_name": normalized_name,
+                    "library": library,
+                    "normalized_library": normalized_library,
+                    "evidence_ids": [],
+                    "observation_ids": [],
+                    "relationship_ids": [rel.id for rel in library_refs.get(normalized_library, []) if getattr(rel, "id", None)],
+                    "labels": labels,
+                }
+            )
+    return {"imports": imports, "library_refs": library_refs}
+
+
+def _macho_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
+    features = details.get("imported_functions")
+    if isinstance(features, list):
+        return [item for item in features if isinstance(item, dict)]
+    slice0 = details.get("first_slice")
+    if isinstance(slice0, dict):
+        features = slice0.get("imported_functions")
+        if isinstance(features, list):
+            return [item for item in features if isinstance(item, dict)]
+    return []
+
+
+def _macho_rule_matches(rule: MachOCapabilityRule, index: dict[str, Any]) -> bool:
+    imports = index["imports"]
+    library_refs = index["library_refs"]
+    if rule.symbols_all and not all(name in imports for name in rule.symbols_all):
+        return False
+    if rule.symbols_any and not any(name in imports for name in rule.symbols_any):
+        return False
+    if rule.libraries_all and not all(normalize_macho_library_name(name) in library_refs for name in rule.libraries_all):
+        return False
+    if rule.libraries_any and not any(normalize_macho_library_name(name) in library_refs for name in rule.libraries_any):
+        return False
+    if not (rule.symbols_any or rule.symbols_all or rule.libraries_any or rule.libraries_all):
+        return False
+    return True
+
+
+def _macho_rule_refs(aid: str, rule: MachOCapabilityRule, index: dict[str, Any]) -> tuple[dict, list[str]]:
+    evidence_ids: list[str] = []
+    observation_ids: list[str] = []
+    relationship_ids: list[str] = []
+    labels: list[str] = []
+
+    wanted = [*rule.symbols_all]
+    if rule.symbols_any:
+        wanted.extend(name for name in rule.symbols_any if name in index["imports"])
+    for name in dict.fromkeys(wanted):
+        for hit in (index["imports"].get(name) or [])[:4]:
+            evidence_ids.extend(hit.get("evidence_ids") or [])
+            observation_ids.extend(hit.get("observation_ids") or [])
+            relationship_ids.extend(hit.get("relationship_ids") or [])
+            labels.extend(hit.get("labels") or [hit.get("name") or name])
+
+    for library in [*rule.libraries_all, *rule.libraries_any]:
+        normalized = normalize_macho_library_name(library)
         for rel in index["library_refs"].get(normalized, []):
             if getattr(rel, "id", None):
                 relationship_ids.append(rel.id)
