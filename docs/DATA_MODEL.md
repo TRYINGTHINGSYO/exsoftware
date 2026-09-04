@@ -42,7 +42,8 @@ A typed edge with provenance.
 | `DEPENDS_ON` | ELF DT_NEEDED / Mach-O dylib |
 | `REFERENCES` | A string or field names an URL, domain, IP, or path |
 | `LINKS_TO` | Shortcut target |
-| `SIGNED_BY` | Authenticode PKCS#7 certificate |
+| `SIGNED_BY` | Authenticode PKCS#7 signing certificate |
+| `ISSUED_BY` | Embedded certificate names another bag certificate as issuer |
 | `EMBEDS` | Reserved for nested payloads with their own bytes |
 | `LOADS` | Reserved for future load-library observations |
 
@@ -117,6 +118,8 @@ PE capability inference uses normalized observations derived from the isolated P
 ELF capability inference uses `elf.import.function` observations from undefined `.dynsym` symbols, plus `DEPENDS_ON` edges for DT_NEEDED libraries. Raw symbol and library names remain in evidence (for example `libcurl.so.4!curl_easy_init`); matching normalizes versioned sonames (`libcurl.so.4` → `libcurl.so`) and symbol versions (`fork@GLIBC_2.2.5` → `fork`). A capability match is inferred static capability, not observed runtime behavior.
 
 Mach-O capability inference uses `macho.import.function` observations from undefined symbol-table entries, plus `DEPENDS_ON` edges for `LC_LOAD_DYLIB` / `LC_LOAD_WEAK_DYLIB`. Those relationship types are unchanged. Raw names remain in evidence (for example `/usr/lib/libSystem.B.dylib!_socket`); matching strips a leading C `_` (`_posix_spawn` → `posix_spawn`), unwraps Objective-C class refs (`_OBJC_CLASS_$_NSURLSession` → `NSURLSession`), and normalizes framework/dylib paths. A capability match is inferred static capability, not observed runtime behavior. No match means not observed, never absent.
+
+Authenticode verification can observe that an embedded PE digest and CMS signature verify with a signing certificate from the PKCS#7 bag, and can derive issuer links inside that bag (`ISSUED_BY`). That is **not** Windows trust validation. Catalog signatures, system/Microsoft roots, and revocation are not checked. `composition.identity.trust_verified` stays false.
 
 ## Analyzer provenance
 

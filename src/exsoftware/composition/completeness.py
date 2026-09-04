@@ -90,11 +90,25 @@ def build_completeness(report: Report) -> tuple[dict, list[dict]]:
         )
     signed_rels = [rel for rel in report.relationships if rel.type == "SIGNED_BY"]
     if signed_rels:
+        crypto_ok = any((rel.extra or {}).get("crypto_valid") is True for rel in signed_rels)
         gaps.append(
             {
                 "id": "GAP.SIG.TRUST_UNVERIFIED.001",
                 "kind": "trust_not_verified",
-                "statement": "A certificate is present. Whether the chain is trusted was not verified.",
+                "statement": (
+                    "The embedded Authenticode digest and CMS signature may have been checked. "
+                    "Trust against Windows/Microsoft roots was not verified."
+                    if crypto_ok
+                    else "A certificate is present. Whether the chain is trusted was not verified."
+                ),
+                "refs": graph_ref(relationship_ids=[rel.id for rel in signed_rels], artifact_ids=[rel.target_id for rel in signed_rels]),
+            }
+        )
+        gaps.append(
+            {
+                "id": "GAP.SIG.REVOCATION_UNCHECKED.001",
+                "kind": "revocation_not_checked",
+                "statement": "Certificate revocation (OCSP/CRL) was not checked. This process does not fetch URLs.",
                 "refs": graph_ref(relationship_ids=[rel.id for rel in signed_rels], artifact_ids=[rel.target_id for rel in signed_rels]),
             }
         )

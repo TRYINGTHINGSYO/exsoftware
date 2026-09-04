@@ -31,6 +31,8 @@ def _from_findings(report: Report) -> list[dict]:
         ("REC.CONTAINER.TIMEOUT.001", "rec.container-timeout", "IMP.ANALYSIS.TIMEOUT.001", "Contained parser timed out", "Archive contents may be missing."),
         ("ARC.PARSE.001", "archive.bad-zip", "IMP.ARC.PARSE.001", "Archive could not be parsed", "Contained files were not recovered."),
         ("SIG.PARSE.001", "signature.parse-error", "IMP.SIG.PARSE.001", "Signature blob could not be parsed", "Signing metadata is incomplete."),
+        ("SIG.CRYPTO.VALID.001", "signature.crypto-valid", "IMP.SIG.CRYPTO_VALID.001", "Embedded Authenticode crypto verifies", "Digest/CMS validity is not Windows trust, catalog, or revocation."),
+        ("SIG.CRYPTO.INVALID.001", "signature.crypto-invalid", "IMP.SIG.CRYPTO_INVALID.001", "Embedded Authenticode crypto did not verify", "The blob is present but the digest or CMS signature failed."),
     ]
     out = []
     for rule_id, legacy, imp_id, title, why in rules:
@@ -88,7 +90,7 @@ def _from_graph(report: Report, capabilities: list[dict]) -> list[dict]:
                 "id": "IMP.SIG.PRESENT.001",
                 "title": "Certificate present; trust not verified",
                 "summary": f"Subject claim: {subject}" if subject else "A certificate is attached.",
-                "why_surfaced": "Presence of a certificate is not the same as a trusted signature.",
+                "why_surfaced": "Presence of a certificate, even with a valid embedded digest, is not Windows trust validation.",
                 "severity": "info",
                 "refs": graph_ref(relationship_ids=[rel.id for rel in signed], artifact_ids=[rel.target_id for rel in signed]),
             }

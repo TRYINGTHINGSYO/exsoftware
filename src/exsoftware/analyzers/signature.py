@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from ..models import Evidence, Finding
+from .authenticode import verify_authenticode
 from .base import Analyzer
 
 try:
@@ -85,6 +86,16 @@ class SignatureAnalyzer(Analyzer):
             cert_type = int.from_bytes(blob[6:8], "little")
             der = blob[8:dw_length] if dw_length <= len(blob) else blob[8:]
             parsed = _parse_pkcs7(der)
+            verification = {
+                "trust_verified": False,
+                "revocation_checked": False,
+                "catalog_checked": False,
+                "digest_valid": None,
+                "signature_valid": None,
+                "errors": [],
+            }
+            if cert_type == WIN_CERT_TYPE_PKCS_SIGNED_DATA and der:
+                verification = verify_authenticode(ctx.data, _trim_der(der))
             details = {
                 "present": True,
                 "offset": offset,
@@ -95,6 +106,7 @@ class SignatureAnalyzer(Analyzer):
                 "certificate_type_name": "PKCS_SIGNED_DATA" if cert_type == WIN_CERT_TYPE_PKCS_SIGNED_DATA else hex(cert_type),
                 "certificates": parsed.get("certificates", []),
                 "parse_error": parsed.get("error"),
+                "verification": verification,
             }
             findings = [
                 Finding(
@@ -126,7 +138,7 @@ class SignatureAnalyzer(Analyzer):
                     Finding(
                         id="signature.certificates",
                         title=f"{len(certs)} certificate(s) extracted from PKCS#7",
-                        summary="Subjects and issuers were parsed from the Authenticode PKCS#7 blob. Trust is not validated against a system root store in this milestone.",
+                        summary="Subjects and issuers were parsed from the Authenticode PKCS#7 blob. Windows/Microsoft-root trust, catalog signatures, and revocation are not checked.",
                         category="signature",
                         severity="info",
                         confidence="high",
@@ -159,6 +171,7 @@ class SignatureAnalyzer(Analyzer):
                         ],
                     )
                 )
+            findings.extend(_verification_findings(verification))
             return self.result(details=details, findings=findings)
         finally:
             pe.close()
@@ -210,6 +223,133 @@ def _parse_pkcs7(der: bytes) -> dict:
             }
         )
     return {"certificates": out}
+
+
+def _verification_findings(verification: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    digest_valid = verification.get("digest_valid")
+    signature_valid = verification.get("signature_valid")
+    if digest_valid is True and signature_valid is True:
+        findings.append(
+            Finding(
+                id="signature.crypto-valid",
+                title="Embedded Authenticode digest and CMS signature verify",
+                summary=(
+                    "The PE Authenticode digest matches the PKCS#7 content and the CMS signature "
+                    "verifies with the signing certificate from the blob. This is not Windows trust "
+                    "validation; catalog signatures and revocation were not checked."
+                ),
+                category="signature",
+                severity="info",
+                confidence="high",
+                analyzer="signature",
+                tags=["signature", "crypto"],
+                evidence=[
+                    Evidence(
+                        kind="field",
+                        summary="Authenticode digest",
+                        analyzer="signature",
+                        value=str(verification.get("digest_embedded") or ""),
+                        extra={
+                            "algorithm": verification.get("digest_algorithm"),
+                            "computed": verification.get("digest_computed"),
+                        },
+                    ),
+                    Evidence(
+                        kind="field",
+                        summary="Signing certificate",
+                        analyzer="signature",
+                        value=(verification.get("signing_certificate") or {}).get("subject") or "unknown",
+                    ),
+                ],
+            )
+        )
+    elif digest_valid is False or signature_valid is False:
+        findings.append(
+            Finding(
+                id="signature.crypto-invalid",
+                title="Embedded Authenticode digest or CMS signature did not verify",
+                summary=(
+                    "The Authenticode blob is present, but the PE digest and/or CMS signature "
+                    "did not verify. This is not a malware verdict."
+                ),
+                category="signature",
+                severity="medium",
+                confidence="high",
+                analyzer="signature",
+                tags=["signature", "crypto"],
+                evidence=[
+                    Evidence(
+                        kind="field",
+                        summary="digest_valid",
+                        analyzer="signature",
+                        value=str(digest_valid),
+                    ),
+                    Evidence(
+                        kind="field",
+                        summary="signature_valid",
+                        analyzer="signature",
+                        value=str(signature_valid),
+                    ),
+                ],
+            )
+        )
+    chain = verification.get("chain") or []
+    if chain:
+        complete = verification.get("chain_complete")
+        findings.append(
+            Finding(
+                id="signature.chain-embedded",
+                title="Embedded certificate chain reconstructed",
+                summary=(
+                    "Issuer/subject links were built from certificates inside the PKCS#7 bag only. "
+                    + (
+                        "The bag ends in a self-signed certificate; that is not a trusted root."
+                        if complete
+                        else "The embedded bag does not reach a self-signed certificate."
+                    )
+                ),
+                category="signature",
+                severity="info",
+                confidence="high" if complete else "medium",
+                analyzer="signature",
+                tags=["signature", "certificate"],
+                evidence=[
+                    Evidence(
+                        kind="field",
+                        summary=item.get("role") or "certificate",
+                        analyzer="signature",
+                        value=item.get("subject") or item.get("serial"),
+                    )
+                    for item in chain[:8]
+                ],
+            )
+        )
+    if verification.get("timestamp_present"):
+        findings.append(
+            Finding(
+                id="signature.timestamp-present",
+                title="Timestamp countersignature present",
+                summary=(
+                    "A timestamp or countersignature attribute is present. "
+                    "The TSA is not trusted or verified in this milestone."
+                ),
+                category="signature",
+                severity="info",
+                confidence="medium",
+                analyzer="signature",
+                tags=["signature", "timestamp"],
+                evidence=[
+                    Evidence(
+                        kind="field",
+                        summary="signing_time",
+                        analyzer="signature",
+                        value=str(verification.get("signing_time") or "present"),
+                    )
+                ],
+            )
+        )
+    return findings
 
 
 def _fmt_time(value) -> str:
