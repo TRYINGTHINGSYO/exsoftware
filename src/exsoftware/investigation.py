@@ -743,7 +743,20 @@ class Investigation:
                     run_id=run_id,
                 )
         elif analyzer_id == "signature":
-            for cert in details.get("certificates") or []:
+            verification = details.get("verification") or {}
+            signing = verification.get("signing_certificate") or {}
+            crypto_valid = None
+            if verification.get("digest_valid") is True and verification.get("signature_valid") is True:
+                crypto_valid = True
+            elif verification.get("digest_valid") is False or verification.get("signature_valid") is False:
+                crypto_valid = False
+            certs = list(details.get("certificates") or [])
+            signed_certs = certs
+            if signing.get("serial"):
+                leaf = [item for item in certs if item.get("serial") == signing.get("serial")]
+                if leaf:
+                    signed_certs = leaf
+            for cert in signed_certs:
                 label = cert.get("subject") or cert.get("serial") or "certificate"
                 target = self.add_named_artifact(
                     "certificate",
@@ -759,7 +772,35 @@ class Investigation:
                     analyzer_id=analyzer_id,
                     analyzer_version=analyzer_version,
                     certainty="observed",
-                    extra={"trust_validated": False},
+                    extra={
+                        "trust_validated": False,
+                        "crypto_valid": crypto_valid,
+                        "chain_role": "leaf" if signing.get("serial") == cert.get("serial") else None,
+                    },
+                    run_id=run_id,
+                )
+            chain = [item for item in (verification.get("chain") or []) if item.get("role") != "bag"]
+            for child, issuer in zip(chain, chain[1:]):
+                child_label = child.get("subject") or child.get("serial") or "certificate"
+                issuer_label = issuer.get("subject") or issuer.get("serial") or "certificate"
+                child_art = self.add_named_artifact(
+                    "certificate",
+                    f"{child.get('serial', '')}|{child_label}",
+                    metadata=child,
+                )
+                issuer_art = self.add_named_artifact(
+                    "certificate",
+                    f"{issuer.get('serial', '')}|{issuer_label}",
+                    metadata=issuer,
+                )
+                self.add_relationship(
+                    "ISSUED_BY",
+                    child_art.id,
+                    issuer_art.id,
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="derived",
+                    extra={"trust_validated": False, "embedded_bag_only": True},
                     run_id=run_id,
                 )
         elif analyzer_id == "script":

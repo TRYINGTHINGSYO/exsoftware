@@ -27,6 +27,7 @@ RelationshipType = Literal[
     "EMBEDS",
     "REFERENCES",
     "SIGNED_BY",
+    "ISSUED_BY",
     "DEPENDS_ON",
     "LOADS",
     "LINKS_TO",

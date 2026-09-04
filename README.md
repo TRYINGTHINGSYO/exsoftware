@@ -79,6 +79,6 @@ python -m compileall src
 - Executing programs
 - AI-written explanations
 - VirusTotal / cloud reputation
-- Full Authenticode trust-chain validation
+- Authenticode trust against Windows/Microsoft roots, catalog signatures, and revocation
 - A malware sandbox (parser isolation is not one)
 - Repository-wide analysis

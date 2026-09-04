@@ -75,6 +75,12 @@ without recognizable imports. No capability match means "not observed by these
 static rules", not "absent". A match is static capability inference, not
 observed runtime behavior.
 
+`identity.trust_verified` remains false even when the isolated signature
+analyzer reports that the embedded Authenticode digest and CMS signature
+verify. That check is offline structural/crypto evidence from the PKCS#7 bag.
+It is not trust against Windows or Microsoft roots, not a catalog signature
+check, and not revocation.
+
 ## Completeness states
 
 | State | Meaning |
