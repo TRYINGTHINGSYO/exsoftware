@@ -17,6 +17,7 @@ from .models import (
 )
 from .rules.catalog import resolve_rule
 from .rules.elf_capabilities import normalize_elf_library_name, normalize_elf_symbol_name
+from .rules.macho_capabilities import normalize_macho_library_name, normalize_macho_symbol_name
 
 try:
     from datetime import UTC
@@ -678,6 +679,16 @@ class Investigation:
         elif analyzer_id == "macho":
             for name in details.get("dylibs") or []:
                 target = self.add_named_artifact("library", name)
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="macho-dylib",
+                    summary=f"Mach-O LC_LOAD_DYLIB {name}",
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    value=name,
+                    extra={"normalized_library": normalize_macho_library_name(name)},
+                    run_id=run_id,
+                )
                 self.add_relationship(
                     "DEPENDS_ON",
                     artifact_id,
@@ -685,6 +696,50 @@ class Investigation:
                     analyzer_id=analyzer_id,
                     analyzer_version=analyzer_version,
                     certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    extra={"normalized_library": normalize_macho_library_name(name)},
+                    run_id=run_id,
+                )
+            for item in _macho_import_features(details):
+                raw_name = item.get("name") or "unknown"
+                library = item.get("library") or "unknown"
+                normalized_name = item.get("normalized_name") or normalize_macho_symbol_name(raw_name)
+                normalized_library = item.get("normalized_library") or normalize_macho_library_name(library)
+                ev = self.add_evidence(
+                    artifact_id=artifact_id,
+                    kind="macho-import-function",
+                    summary=(
+                        f"Mach-O import {library}!{raw_name}" if library != "unknown" else f"Mach-O import {raw_name}"
+                    ),
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    location=f"symtab {library}" if library != "unknown" else "symtab",
+                    value=raw_name,
+                    extra={
+                        "library": library,
+                        "normalized_library": normalized_library,
+                        "normalized_name": normalized_name,
+                    },
+                    run_id=run_id,
+                )
+                self.add_observation(
+                    artifact_id=artifact_id,
+                    kind="macho.import.function",
+                    statement=(
+                        f"Mach-O imports {library}!{raw_name}"
+                        if library != "unknown"
+                        else f"Mach-O imports {raw_name}"
+                    ),
+                    analyzer_id=analyzer_id,
+                    analyzer_version=analyzer_version,
+                    certainty="observed",
+                    evidence_ids=[ev.id] if ev and ev.id else [],
+                    data={
+                        "library": library,
+                        "normalized_library": normalized_library,
+                        "name": raw_name,
+                        "normalized_name": normalized_name,
+                    },
                     run_id=run_id,
                 )
         elif analyzer_id == "signature":
@@ -779,4 +834,16 @@ def _elf_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
     features = details.get("imported_functions")
     if isinstance(features, list):
         return [item for item in features if isinstance(item, dict)]
+    return []
+
+
+def _macho_import_features(details: dict[str, Any]) -> list[dict[str, Any]]:
+    features = details.get("imported_functions")
+    if isinstance(features, list):
+        return [item for item in features if isinstance(item, dict)]
+    slice0 = details.get("first_slice")
+    if isinstance(slice0, dict):
+        features = slice0.get("imported_functions")
+        if isinstance(features, list):
+            return [item for item in features if isinstance(item, dict)]
     return []
