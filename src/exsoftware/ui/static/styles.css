@@ -97,6 +97,26 @@ button.action {
   background: var(--bg-3); color: var(--ink); border: 1px solid var(--line);
   padding: 6px 10px; cursor: pointer; font: inherit;
 }
+button.action.selected { border-color: var(--accent); color: var(--accent); }
+.graph-layout { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); gap: 16px; }
+@media (max-width: 800px) { .graph-layout { grid-template-columns: 1fr; } }
+.graph-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.graph-table th, .graph-table td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+  vertical-align: top; font-family: ui-monospace, Consolas, monospace;
+}
+.graph-table tr { cursor: pointer; }
+.graph-table tr.selected { background: var(--bg-3); }
+.ref-link, .tree-link {
+  background: none; border: 0; color: var(--accent); padding: 0; font: inherit;
+  cursor: pointer; text-decoration: underline; text-align: left;
+}
+.ref-group { margin: 8px 0; }
+.ref-group ul { padding-left: 18px; margin: 4px 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.chip { background: var(--bg-3); border: 1px solid var(--line); padding: 2px 8px; font-size: 12px; }
+.tree-list { list-style: none; padding-left: 0; }
+.tree-list ul { list-style: none; padding-left: 18px; margin: 2px 0; }
 .filter { margin: 8px 0; }
 .filter input, .filter select {
   background: var(--bg-3); color: var(--ink); border: 1px solid var(--line);
